@@ -4,20 +4,18 @@
  * Gateway client and are answered by endpoint name.
  */
 
-import { afterEach, describe, expect, vi } from 'vitest'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import { SessionSeq, type SessionEvent } from '@deepseek-ai/dsh-session/types'
 import type { SessionId } from '@deepseek-ai/dsh-api-remotes/client'
-import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
+import type { FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { createClientTest, webApp } from '@deepseek-ai/dsh-client-test-runtime/src/assembly/index.ts'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { SessionSeq, type SessionEvent } from '@deepseek-ai/dsh-session/types'
+import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
+import { afterEach, describe, expect, vi } from 'vitest'
 import type { PendingSubmissionRetirement } from '../src/client/contract/session.ts'
 import type { SessionRequestId } from '../src/types.ts'
 import { ev, historyValue } from './event-script.client.ts'
 import { sessionBench } from './remote/bench.client.ts'
-import {
-  FOLLOW, err, fileRef, followScript, history, imageRef, pushEvent,
-} from './remote/session.client.ts'
+import { FOLLOW, err, fileRef, followScript, history, imageRef, pushEvent } from './remote/session.client.ts'
 
 /** A Session talks through the Gateway client; its dependency cone is the Typert registry and the Connection. */
 const API_ROSTER = webApp.closure(['@deepseek-ai/dsh-api-gateway'])
@@ -158,6 +156,35 @@ describe('prompt-coupled retirement', () => {
     await session.prompt([{ type: 'text', text: '带 id' }], 'queue', undefined, handle.requestId)
     expect(mock.log.requests('session/prompt')).toMatchObject([{ requestId: handle.requestId, sessionId: SID }])
   })
+
+  for (const mode of ['queue', 'steer'] as const) {
+    it(`preserves the echo identity across addressed child ${mode} retries`, async ({ mock, start }) => {
+      const address = {
+        parentSessionId: 'fk-parent' as SessionId,
+        childSessionId: SID,
+        mode: 'continuable',
+      } as const
+      const session = await sessionBench(mock, start, SID, {
+        address,
+        parentAvailable: true,
+      })
+      const handle = session.beginSubmission({
+        mode,
+        text: 'continue',
+        attachments: [],
+      })
+      const content = [{ type: 'text' as const, text: 'continue' }]
+
+      await session.prompt(content, mode, undefined, handle.requestId)
+      await session.prompt(content, mode, undefined, handle.requestId)
+
+      expect(mock.log.requests('subagents/prompt')).toMatchObject([
+        { ...address, requestId: handle.requestId, delivery: mode, content },
+        { ...address, requestId: handle.requestId, delivery: mode, content },
+      ])
+      expect(mock.log.requests('session/prompt')).toEqual([])
+    })
+  }
 
   it('an unidentified prompt failure leaves registered echoes alone', async ({ mock, start }) => {
     const session = await sessionBench(mock, start, SID)

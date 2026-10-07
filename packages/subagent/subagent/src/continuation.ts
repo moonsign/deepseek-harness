@@ -13,35 +13,31 @@
  * @module @deepseek-ai/dsh-subagent
  */
 
-import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import { ReasoningEffortId, contentHasImage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, MessageId, MessageSource } from '@deepseek-ai/dsh-llm'
-import { SessionLogOffset } from '@deepseek-ai/dsh-session'
+import { ReasoningEffortId, contentHasImage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import { SessionLogOffset } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import type { SessionObservation, SessionQueryEngine } from '@deepseek-ai/dsh-session-query'
+import { randomUUID } from 'node:crypto'
+import { establishCatalogChild } from './catalog.ts'
 import {
-  childSessionMeta,
   captureDelegatedPolicyOverrides,
+  childSessionMeta,
   resolveChildAgentOptions,
   resolveChildDepth,
 } from './child-agent.ts'
-import {
-  ContinuableActivationRegistry,
-} from './continuation-activation.ts'
 import type { Activation } from './continuation-activation.ts'
-import {
-  createAgentMessage,
-  withContinuableReturnGuidance,
-} from './continuation-messages.ts'
+import { ContinuableActivationRegistry } from './continuation-activation.ts'
+import { createAgentMessage, withContinuableReturnGuidance } from './continuation-messages.ts'
+import { ContinuationPromptReceipts } from './continuation-receipts.ts'
 import { assertSubagentMaxDepth } from './depth.ts'
 import { foldSubagentDescriptor, snapshotSubagentDescriptor } from './descriptor.ts'
-import { establishCatalogChild } from './catalog.ts'
 import { SubagentError } from './error.ts'
-import { isAdjacentAgentSendMessageTool } from './internal.ts'
+import { isAdjacentAgentSendMessageTool, type HostPromptContent } from './internal.ts'
 import type { ActivationObserver } from './lifecycle.ts'
 import type {
   ContinuableCreateRequest,
@@ -81,12 +77,14 @@ interface ContinuationHost {
  */
 export class SubagentContinuationManager {
   private readonly activations: ContinuableActivationRegistry
+  private readonly receipts: ContinuationPromptReceipts
 
   constructor(
     private readonly ctx: Context,
     private readonly host: ContinuationHost,
     maxActiveSubagents: () => number,
   ) {
+    this.receipts = new ContinuationPromptReceipts(ctx)
     this.activations = new ContinuableActivationRegistry(
       ctx,
       (provider, childId, parent) => host.observeActivation(provider, childId, parent),
@@ -185,9 +183,8 @@ export class SubagentContinuationManager {
         )
       })
       return { childId, messageId }
-    } catch (error: unknown) {
+    } finally {
       releaseHold()
-      throw error
     }
   }
 
@@ -237,7 +234,7 @@ export class SubagentContinuationManager {
    * Queue one human-authored prompt as a distinct direct-child turn.
    * @param parent - exact live direct parent authorizing delivery.
    * @param childId - durable direct-child session id.
-   * @param content - model-visible prompt blocks.
+   * @param content - prompt blocks or deferred attachment admission for a new message.
    * @param source - durable attribution for the human prompt.
    * @param signal - caller cancellation before inbox acceptance.
    * @returns the accepted durable message id.
@@ -245,7 +242,7 @@ export class SubagentContinuationManager {
   async queuePrompt(
     parent: Agent,
     childId: SessionId,
-    content: ContentBlock[],
+    content: HostPromptContent,
     source: MessageSource,
     signal: AbortSignal,
   ): Promise<MessageId> {
@@ -256,7 +253,7 @@ export class SubagentContinuationManager {
    * Steer one host-authored prompt to a direct continuable child.
    * @param parent - exact live direct parent authorizing delivery.
    * @param childId - durable direct-child session id.
-   * @param content - model-visible prompt blocks.
+   * @param content - prompt blocks or deferred attachment admission for a new message.
    * @param source - durable attribution for the host prompt.
    * @param signal - caller cancellation before inbox acceptance.
    * @returns the accepted durable message id.
@@ -264,7 +261,7 @@ export class SubagentContinuationManager {
   async steerPrompt(
     parent: Agent,
     childId: SessionId,
-    content: ContentBlock[],
+    content: HostPromptContent,
     source: MessageSource,
     signal: AbortSignal,
   ): Promise<MessageId> {
@@ -275,16 +272,15 @@ export class SubagentContinuationManager {
   private async deliverToChild(
     parent: Agent,
     childId: SessionId,
-    content: ContentBlock[],
+    content: HostPromptContent,
     options: ChildDeliveryOptions,
   ): Promise<MessageId> {
     this.activations.assertAdmitting(parent)
     const releaseHold = this.activations.holdOwnership(parent, childId)
     try {
       return await this.deliverFollowup(parent, childId, content, options)
-    } catch (error: unknown) {
+    } finally {
       releaseHold()
-      throw error
     }
   }
 
@@ -292,7 +288,7 @@ export class SubagentContinuationManager {
   private async deliverFollowup(
     parent: Agent,
     childId: SessionId,
-    content: ContentBlock[],
+    content: HostPromptContent,
     options: ChildDeliveryOptions,
   ): Promise<MessageId> {
     while (true) {
@@ -305,14 +301,20 @@ export class SubagentContinuationManager {
         if (disposal !== undefined) {
           return disposal.then(() => undefined, () => undefined)
         }
-        if (contentHasImage(content)) {
+        options.signal.throwIfAborted()
+        this.activations.assertAdmitting(parent)
+        this.activations.authorizeLineage(parent, childId, activation.parentSession)
+        const accepted = this.receipts.accepted(activation.handle.agent.session, options.source)
+        if (accepted !== undefined) return accepted
+        const admitted = typeof content === 'function' ? await content() : content
+        if (contentHasImage(admitted)) {
           await this.assertImageCapable(activation.handle.agent, options.signal)
           if (activation.inbox.closing !== undefined) {
             await Promise.allSettled([activation.inbox.closing])
             return undefined
           }
         }
-        const messageId = this.submitAdmitted(activation, content, options, parent)
+        const messageId = this.submitAdmitted(activation, admitted, options, parent)
         activation.announced = true
         return messageId
       })
@@ -406,7 +408,7 @@ export class SubagentContinuationManager {
   private async coldResume(
     parent: Agent,
     childId: SessionId,
-    content: ContentBlock[],
+    content: HostPromptContent,
     options: ChildDeliveryOptions,
   ): Promise<MessageId> {
     const query = this.requireSessionQuery()
@@ -420,6 +422,7 @@ export class SubagentContinuationManager {
       throw new SubagentError(`subagent "${childId}" is unavailable`, 'NOT_RESUMABLE', { cause: error })
     }
     using source = observation
+    options.signal.throwIfAborted()
     this.activations.assertAdmitting(parent)
     this.activations.authorizeLineage(parent, childId, source.header.parentSession)
     const descriptor = foldSubagentDescriptor(
@@ -431,6 +434,9 @@ export class SubagentContinuationManager {
         'NOT_RESUMABLE',
       )
     }
+    const receipts = this.receipts.recover(source)
+    const accepted = this.receipts.find(receipts, options.source)
+    if (accepted !== undefined) return accepted
     let activation: Activation
     try {
       activation = await this.activations.materialize({
@@ -452,25 +458,27 @@ export class SubagentContinuationManager {
       if (error instanceof SubagentError) throw error
       throw new SubagentError(`subagent "${childId}" is unavailable`, 'NOT_RESUMABLE', { cause: error })
     }
+    this.receipts.restore(activation.handle.agent.session, receipts)
     return await this.submitMaterialized(activation, content, options, parent)
   }
 
   /** Admit a materialized child, commit its creation fact, and release it on failure. */
   private async submitMaterialized(
     activation: Activation,
-    content: ContentBlock[],
+    content: HostPromptContent,
     options: ChildDeliveryOptions,
     parent: Agent,
     commit?: () => void,
   ): Promise<MessageId> {
     try {
-      if (contentHasImage(content)) {
+      const admitted = typeof content === 'function' ? await content() : content
+      if (contentHasImage(admitted)) {
         await this.assertImageCapable(activation.handle.agent, options.signal)
         if (activation.inbox.closing !== undefined) {
           throw new SubagentError(`subagent "${activation.childId}" is closing`, 'ACTIVATION_CLOSING')
         }
       }
-      const messageId = this.submitAdmitted(activation, content, options, parent)
+      const messageId = this.submitAdmitted(activation, admitted, options, parent)
       commit?.()
       activation.announced = true
       return messageId

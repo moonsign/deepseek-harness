@@ -22,55 +22,26 @@
 // llm seam post-boot with installLlmReplay on the settled root ctx
 // (the plugin-row path discards the ReplayHandle; the direct install keeps
 // assertConsumed for the teardown fixture-consumption check).
-import { existsSync, readFileSync } from 'node:fs'
-import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
-import type { Page } from 'playwright'
-import { expect } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { DSH_LAUNCH_ENVIRONMENT_KEY, type LaunchEnvironmentSnapshot } from '@deepseek-ai/dsh-launch-environment'
-import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
-import yaml from 'js-yaml'
-import {
-  captureExpectedWorkspaceSnapshot,
-  captureWorkspaceSnapshot,
-  type CaptureWorkspaceSnapshotOptions,
-  assertSessionFixtureVersion,
-  formatSystemPromptSnapshot,
-  formatToolSchemasSnapshot,
-  normalizedSystemPrompts,
-  normalizedToolSchemas,
-  parseSnapshotManifest,
-  redactSessionSnapshotIds,
-  normalizeSessionSnapshots,
-  parseSessionFixtureName,
-  scrubModelRequestBulk,
-  scrubSessionSnapshot,
-  sessionFixtureFiles,
-  sessionFixtureName,
-  stabilizeFixtureMessageIds,
-  stabilizeRefreshLog,
-  writesCurrentSessionFixtures,
-  type NormalizeContext,
-} from '@deepseek-ai/dsh-session-snapshot'
+import Loader from '@deepseek-ai/cordis-plugin-loader'
 import type { Profile, ProfileContext } from '@deepseek-ai/dsh-app-boot'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
-import { LlmAdapter } from '@deepseek-ai/dsh-llm'
+import { DSH_LAUNCH_ENVIRONMENT_KEY, type LaunchEnvironmentSnapshot } from '@deepseek-ai/dsh-launch-environment'
 import type {
-  LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, RetryPolicyConfig, StreamChunk,
+  LlmModelInfo,
+  LlmProviderInfo,
+  LlmResolvedModelInfo,
+  RetryPolicyConfig,
+  StreamChunk,
 } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { ReplayHandle, ReplayProviderConfig } from '@deepseek-ai/dsh-llm-replay'
 import {
   installLlmReplay,
   parseSessionLog,
   prepareSessionSnapshotFixtureForComparison,
 } from '@deepseek-ai/dsh-llm-replay'
-import type { SessionFormatEvent } from '@deepseek-ai/dsh-session-format'
-import { sessionFormatCatalog } from '@deepseek-ai/dsh-session-format-catalog'
 import {
   SESSION_FORMAT_VERSION,
   SessionId,
@@ -78,11 +49,44 @@ import {
   type SessionEvent,
   type SessionHeader,
 } from '@deepseek-ai/dsh-session'
+import type { SessionFormatEvent } from '@deepseek-ai/dsh-session-format'
+import { sessionFormatCatalog } from '@deepseek-ai/dsh-session-format-catalog'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import {
+  assertSessionFixtureVersion,
+  captureExpectedWorkspaceSnapshot,
+  captureWorkspaceSnapshot,
+  formatSystemPromptSnapshot,
+  formatToolSchemasSnapshot,
+  normalizeSessionSnapshots,
+  normalizedSystemPrompts,
+  normalizedToolSchemas,
+  parseSessionFixtureName,
+  parseSnapshotManifest,
+  redactSessionSnapshotIds,
+  scrubModelRequestBulk,
+  scrubSessionSnapshot,
+  sessionFixtureFiles,
+  sessionFixtureName,
+  stabilizeFixtureMessageIds,
+  stabilizeRefreshLog,
+  writesCurrentSessionFixtures,
+  type CaptureWorkspaceSnapshotOptions,
+  type NormalizeContext,
+} from '@deepseek-ai/dsh-session-snapshot'
+import yaml from 'js-yaml'
+import { createHash } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import type { Page } from 'playwright'
+import { expect } from 'vitest'
 // Empty type imports carry the webServer/agents/sessionPersistence Context merges.
-import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-agent'
 import { provideCmdline } from '@deepseek-ai/dsh-cmdline'
+import type {} from '@deepseek-ai/dsh-host-webserver'
 import { startPrefixProxy, type PrefixProxy } from './prefix-proxy.ts'
 import { REPO_ROOT, requireBuilt, requireDist } from './support.ts'
 
@@ -397,6 +401,8 @@ export interface LaunchOptions {
   deepSeekMissingCredential?: boolean
   /** Leave the current welcome notice pending; ordinary scenarios pre-acknowledge it before browser boot. */
   welcomeNoticePending?: boolean
+  /** Keep the deterministic browse backend but omit its stock Client view when false; defaults to true. */
+  directoryPickerUI?: boolean
   /** Leave first-use Workspace initialization eligible; ordinary scenarios start after the default was removed. */
   firstUse?: boolean
   /**
@@ -656,7 +662,9 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
     { id: 'directory-picker', disabled: true },
     { insert: [
       { id: 'directory-picker-browse', name: '@deepseek-ai/dsh-host-directory-picker-browse' },
-      { id: 'ui-directory-picker-browse', name: '@deepseek-ai/dsh-client-ui-directory-picker-browse' },
+      ...options.directoryPickerUI === false ? [] : [
+        { id: 'ui-directory-picker-browse', name: '@deepseek-ai/dsh-client-ui-directory-picker-browse' },
+      ],
     ] },
     // Ordinary scenarios exclude host-dependent application discovery. The
     // Open In scenario supplies launch facts that suppress every native probe.

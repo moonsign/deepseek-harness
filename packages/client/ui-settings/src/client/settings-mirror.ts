@@ -39,8 +39,8 @@ export interface SettingsMirrorSnapshot {
 
 /**
  * The mirror as cross-namespace surfaces consume it: current answer,
- * subscription, first-use read, and the write-answer fold. `load` stays off
- * this face — invalidation refreshes belong to the mirror's owning plugin.
+ * subscription, first-use read, explicit refresh, and the write-answer fold.
+ * All reads share the mirror owner's scheduling.
  */
 export interface SettingsDescribeFace {
   /** @returns the current sync snapshot (stable reference until the next change). */
@@ -57,6 +57,11 @@ export interface SettingsDescribeFace {
    * @returns settlement of the current or newly started read, if any.
    */
   ensure(): Promise<void>
+  /**
+   * Read the Host again through the shared owner's coalesced scheduling.
+   * @returns settlement after this call's freshness is reflected.
+   */
+  refresh(): Promise<void>
   /**
    * Fold one write answer's namespace view into the held view without a wire
    * read, invalidating any older read still in flight.
@@ -75,6 +80,7 @@ export class SettingsDescribeMirror implements SettingsDescribeFace {
   private inFlight: Promise<void> | undefined
   private rerun = false
   private generation = 0
+  private disposed = false
 
   /**
    * @param ctx - the providing plugin's context, whose `remote.settings`
@@ -112,7 +118,7 @@ export class SettingsDescribeMirror implements SettingsDescribeFace {
    * @returns settlement after this call's freshness is reflected.
    */
   load(): Promise<void> {
-    if (this.persistence === 'memory') return Promise.resolve()
+    if (this.disposed || this.persistence === 'memory') return Promise.resolve()
     if (this.inFlight !== undefined) {
       this.rerun = true
       return this.inFlight
@@ -130,10 +136,30 @@ export class SettingsDescribeMirror implements SettingsDescribeFace {
    * @returns settlement of the current or newly started read, if any.
    */
   ensure(): Promise<void> {
-    if (this.persistence === 'memory') return Promise.resolve()
+    if (this.disposed || this.persistence === 'memory') return Promise.resolve()
     if (this.inFlight !== undefined) return this.inFlight
     if (this.getSnapshot().status === 'idle') return this.load()
     return Promise.resolve()
+  }
+
+  /**
+   * Read the Host again through the shared owner's coalesced scheduling.
+   * @returns settlement after this call's freshness is reflected.
+   */
+  refresh(): Promise<void> {
+    return this.load()
+  }
+
+  /**
+   * Stop new reads and publication, discard rerun intent, and drain the current read.
+   * The describe Remote has no cancellation parameter.
+   * @returns settlement after the already-started read reaches quiescence.
+   */
+  dispose(): Promise<void> {
+    this.disposed = true
+    this.generation += 1
+    this.rerun = false
+    return this.inFlight ?? Promise.resolve()
   }
 
   /**
@@ -144,12 +170,13 @@ export class SettingsDescribeMirror implements SettingsDescribeFace {
    * @param view - the namespace view a settings write answered with.
    */
   acceptView(view: SettingsNamespaceView): void {
+    if (this.disposed) return
     const before = this.store.getSnapshot()
     this.generation += 1
     if (this.inFlight !== undefined) this.rerun = true
     if (before.view === undefined) return
     const namespaces = before.view.namespaces.some(row => row.ns === view.ns)
-      ? before.view.namespaces.map(row => row.ns === view.ns ? view : row)
+      ? before.view.namespaces.map(row => (row.ns === view.ns ? view : row))
       : [...before.view.namespaces, view]
     this.store.set({ ...before, view: { ...before.view, namespaces } })
   }
@@ -170,8 +197,11 @@ export class SettingsDescribeMirror implements SettingsDescribeFace {
     // that gap would mark a rerun nobody reads, losing the read.
     try {
       do {
+        if (this.disposed) return
         const before = this.store.getSnapshot()
         if (before.status === 'idle') this.store.set({ ...before, status: 'loading' })
+        // oxlint-disable-next-line typescript/no-unnecessary-condition -- Loading listeners can synchronously dispose the mirror.
+        if (this.disposed) return
         // Cleared immediately before the wire read goes out: a load() marked
         // earlier (including one reentering from the loading publish above)
         // is covered by this very read, while one landing after needs the
@@ -181,9 +211,7 @@ export class SettingsDescribeMirror implements SettingsDescribeFace {
         let outcome: { view: SettingsDescribeView } | { failure: string }
         try {
           const response = await this.ctx.remote.settings.describe()
-          outcome = response.ok
-            ? { view: response.value }
-            : { failure: response.error.message }
+          outcome = response.ok ? { view: response.value } : { failure: response.error.message }
         } catch (error) {
           outcome = { failure: error instanceof Error ? error.message : String(error) }
         }
@@ -208,6 +236,6 @@ export class SettingsDescribeMirror implements SettingsDescribeFace {
   }
 
   private shouldRerun(): boolean {
-    return this.rerun
+    return !this.disposed && this.rerun
   }
 }

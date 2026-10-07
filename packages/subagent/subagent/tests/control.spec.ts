@@ -1,16 +1,13 @@
 // The browser-facing prompt and interrupt controls and their stable failure
 // codes. Session Controller owns catalog observation and transport.
 
-import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import AttachmentStore, { AttachmentError } from '@deepseek-ai/dsh-attachment'
-import type { MessageId } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, MessageId } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import SubagentRuntime, {
-  SubagentError,
-  type SubagentPromptRequestId,
-} from '@deepseek-ai/dsh-subagent'
+import SubagentRuntime, { SubagentError, type SubagentPromptRequestId } from '@deepseek-ai/dsh-subagent'
 import { deliverSubagentPrompt, type HostPromptDeliverer } from '@deepseek-ai/dsh-subagent/internal'
+import { describe, expect, it, vi } from 'vitest'
 
 const PARENT = SessionId('parent')
 const CHILD = SessionId('child')
@@ -40,6 +37,16 @@ async function bench(live?: Record<string, { status: 'running' | 'idle' }>) {
 /** Spy on the private human-Queue adapter without widening the public service. */
 function promptDelivery(subagents: SubagentRuntime) {
   return vi.spyOn(subagents as unknown as HostPromptDeliverer, deliverSubagentPrompt)
+}
+
+/** Evaluate deferred admission without composing the child runtime. */
+function admittingPromptDelivery(subagents: SubagentRuntime) {
+  let admitted: ContentBlock[] | undefined
+  const delivery = promptDelivery(subagents).mockImplementation(async (_parent, _child, content) => {
+    admitted = typeof content === 'function' ? await content() : content
+    return 'm-content' as MessageId
+  })
+  return { delivery, admitted: () => admitted }
 }
 
 function promptRequest(clientTimeZone?: string, delivery: 'queue' | 'steer' = 'queue') {
@@ -104,7 +111,7 @@ describe('subagent prompt Remote', () => {
     const saveImages = vi.fn(async (inputs: readonly { mediaType: string }[]) =>
       inputs.map((input, index) => ({ ...IMAGE_REF, attachmentId: `att-${index}`, mediaType: input.mediaType })))
     ctx.provide('attachments', Object.setPrototypeOf({ saveImages }, AttachmentStore.prototype) as never)
-    const delivery = promptDelivery(subagents).mockResolvedValue('m-content' as MessageId)
+    const { admitted } = admittingPromptDelivery(subagents)
     const content = [
       { type: 'text' as const, text: 'before' },
       { type: 'image' as const, mediaType: 'image/png' as const, data: 'aGk=' },
@@ -113,7 +120,7 @@ describe('subagent prompt Remote', () => {
 
     await expect(subagents.prompt({ ...promptRequest(), content }, signal))
       .resolves.toEqual({ messageId: 'm-content' })
-    expect(delivery.mock.calls[0]?.[2]).toEqual([
+    expect(admitted()).toEqual([
       { type: 'text', text: 'before' },
       { type: 'image', attachment: { ...IMAGE_REF, attachmentId: 'att-0', mediaType: 'image/png' } },
       { type: 'text', text: 'after' },
@@ -127,7 +134,7 @@ describe('subagent prompt Remote', () => {
         throw new AttachmentError('Image batch exceeds the configured image-count limit.', 'TOO_MANY_IMAGES')
       },
     }, AttachmentStore.prototype) as never)
-    const delivery = promptDelivery(subagents)
+    const { admitted } = admittingPromptDelivery(subagents)
 
     await expect(subagents.prompt({
       ...promptRequest(),
@@ -135,14 +142,14 @@ describe('subagent prompt Remote', () => {
     }, signal)).rejects.toMatchObject({
       code: 'subagent/attachment-invalid', details: { reason: 'TOO_MANY_IMAGES' },
     })
-    expect(delivery).not.toHaveBeenCalled()
+    expect(admitted()).toBeUndefined()
   })
 
   it('maps non-canonical base64 to subagent/attachment-invalid without touching the store', async () => {
     const { ctx, subagents } = await bench({ [PARENT]: { status: 'idle' } })
     const saveImages = vi.fn()
     ctx.provide('attachments', Object.setPrototypeOf({ saveImages }, AttachmentStore.prototype) as never)
-    const delivery = promptDelivery(subagents)
+    const { admitted } = admittingPromptDelivery(subagents)
 
     await expect(subagents.prompt({
       ...promptRequest(),
@@ -151,18 +158,18 @@ describe('subagent prompt Remote', () => {
       code: 'subagent/attachment-invalid', details: { reason: 'INVALID_IMAGE_BASE64' },
     })
     expect(saveImages).not.toHaveBeenCalled()
-    expect(delivery).not.toHaveBeenCalled()
+    expect(admitted()).toBeUndefined()
   })
 
   it('rejects an image prompt when no attachment store is composed', async () => {
     const { subagents } = await bench({ [PARENT]: { status: 'idle' } })
-    const delivery = promptDelivery(subagents)
+    const { admitted } = admittingPromptDelivery(subagents)
 
     await expect(subagents.prompt({
       ...promptRequest(),
       content: [{ type: 'image' as const, mediaType: 'image/png' as const, data: 'aGk=' }],
     }, signal)).rejects.toMatchObject({ code: 'gateway/internal', message: 'subagent prompt failed' })
-    expect(delivery).not.toHaveBeenCalled()
+    expect(admitted()).toBeUndefined()
   })
 
   it('maps a text-only child model refusal to subagent/attachment-invalid', async () => {

@@ -1,7 +1,7 @@
-import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import type { JobId } from '@deepseek-ai/dsh-jobs/brand'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ClientJobsModel } from '../src/client/model.ts'
 import { ClientJobs } from '../src/client/service.ts'
 import type { JobFollowFrame, JobListFrame, JobView } from '../src/types.ts'
@@ -12,7 +12,11 @@ const S2 = 'bob' as SessionId
 
 function view(over: Partial<JobView> = {}): JobView {
   return {
-    id: ID, kind: 'bash', label: 'pnpm run build', status: 'running', startedAt: 5,
+    id: ID,
+    kind: 'bash',
+    label: 'pnpm run build',
+    status: 'running',
+    startedAt: 5,
     output: { total: 0, earliest: 0 },
     ...over,
   }
@@ -27,10 +31,12 @@ function opened(model: ClientJobsModel, over: Partial<{ from: number; earliest: 
 }
 
 describe('ClientJobsModel rows', () => {
-  it('replaces a session roster whole, stores an empty set as absence, and drops on release', () => {
+  it('replaces a session roster whole, retains a received empty set, and drops on release', () => {
     const model = new ClientJobsModel()
     let notified = 0
-    model.subscribe(() => { notified += 1 })
+    model.subscribe(() => {
+      notified += 1
+    })
     model.rowsReplaced(S1, [view()])
     model.rowsReplaced(S2, [view({ id: 'pwsh-1' as JobId, label: 'other' })])
     expect(model.getSnapshot().rows[S1]).toEqual([view()])
@@ -42,15 +48,19 @@ describe('ClientJobsModel rows', () => {
     expect(notified).toBe(3)
 
     model.rowsReplaced(S1, [])
-    expect(S1 in model.getSnapshot().rows).toBe(false)
-    // An empty set over an absent key changes nothing.
+    expect(model.getSnapshot().rows[S1]).toEqual([])
+    expect(model.getSnapshot().rosterStatus[S1]).toEqual({ state: 'ready', error: null })
+    // Every frame is an authoritative whole set.
     model.rowsReplaced(S1, [])
-    expect(notified).toBe(4)
+    expect(notified).toBe(5)
 
     model.rowsDropped(S2)
-    expect(model.getSnapshot().rows).toEqual({})
+    expect(model.getSnapshot().rows).toEqual({ [S1]: [] })
     model.rowsDropped(S2)
-    expect(notified).toBe(5)
+    expect(notified).toBe(6)
+    model.rowsDropped(S1)
+    expect(model.getSnapshot().rows).toEqual({})
+    expect(model.getSnapshot().rosterStatus).toEqual({})
   })
 })
 
@@ -59,7 +69,14 @@ describe('ClientJobsModel observation', () => {
     const model = new ClientJobsModel()
     opened(model)
     expect(model.cursorOf(ID)).toBe(0)
-    model.observeOutput(ID, { type: 'output', chunks: [{ at: 0, text: 'a' }, { at: 1, text: 'b' }], next: 2 })
+    model.observeOutput(ID, {
+      type: 'output',
+      chunks: [
+        { at: 0, text: 'a' },
+        { at: 1, text: 'b' },
+      ],
+      next: 2,
+    })
     model.observeOutput(ID, { type: 'output', chunks: [{ at: 2, text: 'c' }], next: 3 })
     expect(model.cursorOf(ID)).toBe(3)
     const live = model.getSnapshot().observed[String(ID)]
@@ -72,7 +89,9 @@ describe('ClientJobsModel observation', () => {
   it('keeps snapshot identity stable between changes and notifies subscribers', () => {
     const model = new ClientJobsModel()
     let notified = 0
-    const unsubscribe = model.subscribe(() => { notified += 1 })
+    const unsubscribe = model.subscribe(() => {
+      notified += 1
+    })
     const before = model.getSnapshot()
     expect(model.getSnapshot()).toBe(before)
     opened(model)
@@ -117,7 +136,7 @@ describe('ClientJobsModel observation', () => {
   it('bounds the render tail without splitting a surrogate pair', () => {
     const model = new ClientJobsModel()
     opened(model)
-    const emoji = '😀'.repeat((64 * 1024) + 8)
+    const emoji = '😀'.repeat(64 * 1024 + 8)
     model.observeOutput(ID, { type: 'output', chunks: [{ at: 0, text: emoji }], next: emoji.length * 2 })
     const live = model.getSnapshot().observed[String(ID)]
     expect(live?.gapBefore).toBe(true)
@@ -129,7 +148,7 @@ describe('ClientJobsModel observation', () => {
   it('trims a plain-ASCII tail without a boundary shift', () => {
     const model = new ClientJobsModel()
     opened(model)
-    const long = 'x'.repeat((128 * 1024) + 5)
+    const long = 'x'.repeat(128 * 1024 + 5)
     model.observeOutput(ID, { type: 'output', chunks: [{ at: 0, text: long }], next: long.length })
     const live = model.getSnapshot().observed[String(ID)]
     expect(live?.text.length).toBe(128 * 1024)
@@ -140,10 +159,10 @@ describe('ClientJobsModel observation', () => {
     const model = new ClientJobsModel()
     opened(model)
     // 'z' + one emoji + odd ASCII tail puts a low surrogate exactly at the cut index.
-    const text = 'z😀' + 'a'.repeat((128 * 1024) - 1)
+    const text = 'z😀' + 'a'.repeat(128 * 1024 - 1)
     model.observeOutput(ID, { type: 'output', chunks: [{ at: 0, text }], next: text.length })
     const live = model.getSnapshot().observed[String(ID)]
-    expect(live?.text.length).toBe((128 * 1024) - 1)
+    expect(live?.text.length).toBe(128 * 1024 - 1)
     expect(live?.text.startsWith('a')).toBe(true)
   })
 
@@ -180,6 +199,8 @@ describe('ClientJobsModel observation', () => {
 /** One scripted logical stream: frames are pushed by the test, never reopened. */
 class FakeStream<Frame> {
   disposed = false
+  deliverAfterDispose = false
+  generationAbort = new AbortController()
   /** Model a carrier whose disposal surfaces as an iterator throw. */
   throwOnDispose = false
   /** Hold the dispose promise open until {@link releaseDispose}. */
@@ -211,7 +232,9 @@ class FakeStream<Frame> {
     if (this.deferDispose) {
       // Repeat disposals (releaser plus the consumer's finally) share one
       // deferred promise, so releaseDispose resumes every waiter.
-      this.disposePending ??= new Promise((resolve) => { this.disposeRelease = resolve })
+      this.disposePending ??= new Promise((resolve) => {
+        this.disposeRelease = resolve
+      })
       return this.disposePending
     }
     return Promise.resolve()
@@ -223,18 +246,22 @@ class FakeStream<Frame> {
 
   async *[Symbol.asyncIterator]() {
     let generation = 1
-    while (!this.disposed) {
+    while (!this.disposed || (this.deliverAfterDispose && this.frames.length > 0)) {
       if (this.failure !== undefined) throw this.failure
       const frame = this.frames.shift()
       if (frame === undefined) {
-        await new Promise<void>((resolve) => { this.waiter = resolve })
+        await new Promise<void>((resolve) => {
+          this.waiter = resolve
+        })
         continue
       }
       yield {
         generation,
         value: frame,
-        signal: new AbortController().signal,
-        accept: () => { this.accepts.push(generation) },
+        signal: this.generationAbort.signal,
+        accept: () => {
+          this.accepts.push(generation)
+        },
       }
       generation = 1
     }
@@ -245,9 +272,18 @@ interface StreamOptions {
   name: string
   open: (signal: AbortSignal) => unknown
   ended: (accepted: boolean) => Error
+  carrierFailed?: (error: Error) => void
 }
 
-function bench() {
+const benches: { ctx: Context; release: () => void }[] = []
+afterEach(async () => {
+  for (const { ctx, release } of benches.splice(0)) {
+    release()
+    await ctx.fiber.dispose()
+  }
+})
+
+function bench(onCreated?: (count: number) => void) {
   const ctx = new Context()
   const model = new ClientJobsModel()
   const streams: { options: StreamOptions; stream: FakeStream<JobFollowFrame> & FakeStream<JobListFrame> }[] = []
@@ -258,16 +294,25 @@ function bench() {
     $stream: (options: StreamOptions) => {
       const stream = new FakeStream<never>()
       streams.push({ options, stream })
+      onCreated?.(streams.length)
       return stream
     },
     job: {
       follow: (request: unknown) => {
         observeCalls.push(request)
-        return { [Symbol.asyncIterator]: async function* () { /* never yields */ } }
+        return {
+          [Symbol.asyncIterator]: async function* () {
+            /* never yields */
+          },
+        }
       },
       list: (request: unknown) => {
         rowsCalls.push(request)
-        return { [Symbol.asyncIterator]: async function* () { /* never yields */ } }
+        return {
+          [Symbol.asyncIterator]: async function* () {
+            /* never yields */
+          },
+        }
       },
       kill: async (request: unknown) => {
         killCalls.push(request)
@@ -276,6 +321,12 @@ function bench() {
     },
   }
   const jobs = new ClientJobs(ctx, remote as never, model)
+  benches.push({
+    ctx,
+    release: () => {
+      for (const { stream } of streams) stream.releaseDispose()
+    },
+  })
   return { ctx, model, jobs, streams, observeCalls, rowsCalls, killCalls }
 }
 
@@ -325,7 +376,7 @@ describe('ClientJobs roster streams', () => {
     expect(options.ended(false).name).toBe('Error')
   })
 
-  it('drops the roster on a terminal stream failure', async () => {
+  it('retains the roster and records terminal failure', async () => {
     const { model, jobs, streams } = bench()
     jobs.watchRows(S1)
     const { stream } = streams[0]!
@@ -334,7 +385,8 @@ describe('ClientJobs roster streams', () => {
     expect(model.getSnapshot().rows[S1]).toBeDefined()
     stream.poison(new Error('frame decode broke'))
     await tick()
-    expect(S1 in model.getSnapshot().rows).toBe(false)
+    expect(model.getSnapshot().rows[S1]).toEqual([view()])
+    expect(model.getSnapshot().rosterStatus[S1]).toEqual({ state: 'error', error: 'Error: frame decode broke' })
   })
 
   it('stays silent when the carrier teardown itself throws after the last release', async () => {
@@ -371,6 +423,226 @@ describe('ClientJobs roster streams', () => {
     await tick()
     // The stale post-dispose clear must not blank the successor's rows.
     expect(model.getSnapshot().rows[S1]?.[0]?.label).toBe('fresh')
+  })
+})
+
+describe('ClientJobs roster recovery ownership', () => {
+  it('publishes loading before a frame, keeps empty ready data, and keeps data through carrier loss', async () => {
+    const { jobs, model, streams } = bench()
+    const release = jobs.watchRows(S1)
+    expect(model.getSnapshot().rosterStatus[S1]).toEqual({ state: 'loading', error: null })
+    expect(model.getSnapshot().rows[S1]).toBeUndefined()
+    streams[0]!.stream.push({ type: 'rows', jobs: [] })
+    await tick()
+    expect(model.getSnapshot().rows[S1]).toEqual([])
+    expect(model.getSnapshot().rosterStatus[S1]).toEqual({ state: 'ready', error: null })
+    streams[0]!.options.carrierFailed?.(new Error('lost carrier'))
+    expect(model.getSnapshot().rosterStatus[S1]).toEqual({ state: 'loading', error: null })
+    expect(model.getSnapshot().rows[S1]).toEqual([])
+    release()
+    await tick()
+    expect(model.getSnapshot().rosterStatus[S1]).toBeUndefined()
+  })
+
+  it('coalesces retries, preserves both original releases, and acquires no retry watcher', async () => {
+    const { jobs, model, streams } = bench()
+    const first = jobs.watchRows(S1)
+    const second = jobs.watchRows(S1)
+    streams[0]!.stream.push({ type: 'rows', jobs: [view()] })
+    await tick()
+    jobs.retryRows(S1)
+    expect(streams).toHaveLength(1)
+    streams[0]!.stream.poison(new Error('failed'))
+    await tick()
+    jobs.retryRows(S1)
+    jobs.retryRows(S1)
+    expect(model.getSnapshot().rosterStatus[S1]).toEqual({ state: 'loading', error: null })
+    expect(model.getSnapshot().rows[S1]).toEqual([view()])
+    await tick()
+    expect(streams).toHaveLength(2)
+    streams[1]!.stream.push({ type: 'rows', jobs: [] })
+    await tick()
+    first()
+    first()
+    expect(streams[1]!.stream.disposed).toBe(false)
+    second()
+    await tick()
+    expect(streams[1]!.stream.disposed).toBe(true)
+    expect(model.getSnapshot().rosterStatus[S1]).toBeUndefined()
+    jobs.retryRows(S1)
+    expect(streams).toHaveLength(2)
+  })
+
+  it('re-watches a failed owner and waits for predecessor disposal before replacement', async () => {
+    const { jobs, model, streams } = bench()
+    const first = jobs.watchRows(S1)
+    const predecessor = streams[0]!.stream
+    predecessor.deferDispose = true
+    predecessor.push({ type: 'rows', jobs: [view()] })
+    await tick()
+    predecessor.poison(new Error('failed'))
+    await tick()
+    const second = jobs.watchRows(S1)
+    jobs.retryRows(S1)
+    expect(streams).toHaveLength(1)
+    expect(model.getSnapshot().rosterStatus[S1]?.state).toBe('loading')
+    first()
+    predecessor.releaseDispose()
+    await tick()
+    expect(streams).toHaveLength(2)
+    streams[1]!.stream.push({ type: 'rows', jobs: [view({ label: 'replacement' })] })
+    await tick()
+    expect(model.getSnapshot().rows[S1]?.[0]?.label).toBe('replacement')
+    expect(streams[1]!.stream.disposed).toBe(false)
+    second()
+    await tick()
+    expect(model.getSnapshot().rows[S1]).toBeUndefined()
+  })
+
+  it('does not open a pending retry after final release or clear a fresh successor', async () => {
+    const { jobs, model, streams } = bench()
+    const stop = jobs.watchRows(S1)
+    const predecessor = streams[0]!.stream
+    predecessor.deferDispose = true
+    predecessor.push({ type: 'rows', jobs: [view()] })
+    await tick()
+    predecessor.poison(new Error('failed'))
+    await tick()
+    jobs.retryRows(S1)
+    stop()
+    const successorStop = jobs.watchRows(S1)
+    expect(model.getSnapshot().rows[S1]).toBeUndefined()
+    streams[1]!.stream.push({ type: 'rows', jobs: [view({ label: 'fresh owner' })] })
+    await tick()
+    predecessor.releaseDispose()
+    await tick()
+    expect(streams).toHaveLength(2)
+    expect(model.getSnapshot().rows[S1]?.[0]?.label).toBe('fresh owner')
+    stop()
+    expect(streams[1]!.stream.disposed).toBe(false)
+    successorStop()
+  })
+
+  it('installs replacement ownership before a failure subscriber retries synchronously', async () => {
+    const { jobs, model, streams } = bench()
+    const stop = jobs.watchRows(S1)
+    const off = model.subscribe(() => {
+      if (model.getSnapshot().rosterStatus[S1]?.state === 'error') jobs.retryRows(S1)
+    })
+    streams[0]!.stream.poison(new Error('first failure'))
+    await tick()
+    expect(streams).toHaveLength(2)
+    streams[1]!.stream.push({ type: 'rows', jobs: [] })
+    await tick()
+    expect(model.getSnapshot().rosterStatus[S1]?.state).toBe('ready')
+    off()
+    stop()
+  })
+
+  it('awaits a retiring failed generation when disposal happens during retry', async () => {
+    const { ctx, jobs, model, streams } = bench()
+    const stop = jobs.watchRows(S1)
+    const predecessor = streams[0]!.stream
+    predecessor.deferDispose = true
+    predecessor.poison(new Error('failed'))
+    await tick()
+    jobs.retryRows(S1)
+    let settled = false
+    const disposal = ctx.fiber.dispose().then(() => {
+      settled = true
+    })
+    await tick()
+    expect(settled).toBe(false)
+    expect(model.getSnapshot().rosterStatus).toEqual({})
+    predecessor.releaseDispose()
+    await disposal
+    expect(streams).toHaveLength(1)
+    stop()
+    jobs.retryRows(S1)
+    jobs.watchRows(S1)()
+    jobs.observe(undefined, ID)()
+    expect(streams).toHaveLength(1)
+  })
+})
+
+describe('ClientJobs roster callback retirement', () => {
+  it('records synchronous stream construction failure and can retry without a prior carrier', async () => {
+    const { jobs, model, streams } = bench((count) => {
+      if (count === 1) throw new Error('opening failed')
+    })
+    const stop = jobs.watchRows(S1)
+    expect(model.getSnapshot().rosterStatus[S1]).toEqual({ state: 'error', error: 'Error: opening failed' })
+    jobs.retryRows(S1)
+    await tick()
+    streams[1]!.stream.push({ type: 'rows', jobs: [] })
+    await tick()
+    expect(model.getSnapshot().rosterStatus[S1]?.state).toBe('ready')
+    stop()
+  })
+
+  it('retires a retry before construction when its loading subscriber releases and reacquires', async () => {
+    const { jobs, model, streams } = bench()
+    const stop = jobs.watchRows(S1)
+    streams[0]!.stream.push({ type: 'rows', jobs: [view()] })
+    await tick()
+    streams[0]!.stream.poison(new Error('failed'))
+    await tick()
+    let successorStop = () => {}
+    const off = model.subscribe(() => {
+      const snapshot = model.getSnapshot()
+      if (snapshot.rosterStatus[S1]?.state === 'loading' && snapshot.rows[S1] !== undefined) {
+        stop()
+        successorStop = jobs.watchRows(S1)
+      }
+    })
+    jobs.retryRows(S1)
+    await tick()
+    expect(streams).toHaveLength(2)
+    streams[1]!.stream.push({ type: 'rows', jobs: [view({ label: 'successor' })] })
+    await tick()
+    expect(model.getSnapshot().rows[S1]?.[0]?.label).toBe('successor')
+    off()
+    successorStop()
+  })
+
+  it('closes a stream constructed while its final watcher releases, and rejects stale opens', async () => {
+    let stop = () => {}
+    const { jobs, model, streams, rowsCalls } = bench((count) => {
+      if (count === 2) stop()
+    })
+    stop = jobs.watchRows(S1)
+    streams[0]!.stream.poison(new Error('failed'))
+    await tick()
+    jobs.retryRows(S1)
+    await tick()
+    expect(streams[1]!.stream.disposed).toBe(true)
+    expect(model.getSnapshot().rosterStatus[S1]).toBeUndefined()
+    const snapshot = model.getSnapshot()
+    expect(() => streams[1]!.options.open(new AbortController().signal)).toThrow('released before open')
+    streams[1]!.options.carrierFailed?.(new Error('late carrier loss'))
+    expect(model.getSnapshot()).toBe(snapshot)
+    expect(rowsCalls).toEqual([])
+  })
+
+  it('ignores an aborted-generation frame and a predecessor frame already in flight at final release', async () => {
+    const { jobs, model, streams } = bench()
+    const stop = jobs.watchRows(S1)
+    const first = streams[0]!.stream
+    first.generationAbort.abort()
+    first.push({ type: 'rows', jobs: [view({ label: 'aborted' })] })
+    await tick()
+    expect(model.getSnapshot().rows[S1]).toBeUndefined()
+    expect(first.accepts).toEqual([])
+    first.generationAbort = new AbortController()
+    first.deliverAfterDispose = true
+    first.push({ type: 'rows', jobs: [view({ label: 'late predecessor' })] })
+    stop()
+    const successorStop = jobs.watchRows(S1)
+    streams[1]!.stream.push({ type: 'rows', jobs: [view({ label: 'fresh' })] })
+    await tick()
+    expect(model.getSnapshot().rows[S1]?.[0]?.label).toBe('fresh')
+    expect(first.accepts).toEqual([])
+    successorStop()
   })
 })
 
@@ -542,7 +814,9 @@ describe('ClientJobs observation streams', () => {
     await tick()
 
     let settled = false
-    const disposal = ctx.fiber.dispose().then(() => { settled = true })
+    const disposal = ctx.fiber.dispose().then(() => {
+      settled = true
+    })
     await tick()
     // Both carriers were told to stop, but neither iterator has closed yet:
     // the fiber must still be unloading, or a successor plugin instance could

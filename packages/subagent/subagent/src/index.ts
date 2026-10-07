@@ -31,25 +31,37 @@
 import type { Volatile } from '@deepseek-ai/cordis'
 
 import { Context } from '@deepseek-ai/cordis'
-import z from '@deepseek-ai/schemastery'
-import type {} from '@deepseek-ai/dsh-attachment'
-import { scopeTarget } from '@deepseek-ai/dsh-scope'
-import type { Scoped } from '@deepseek-ai/dsh-scope'
-import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
-import type { ContentBlock, MessageId, MessageSource } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-attachment'
+import type { ContentBlock, MessageId, MessageSource } from '@deepseek-ai/dsh-llm'
+import type { Scoped } from '@deepseek-ai/dsh-scope'
+import { scopeTarget } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { canonicalClientTimeZone } from '@deepseek-ai/dsh-util-time'
+import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
-import {
-  rejectPrompt, validateControlRequest,
-} from './control.ts'
+import { canonicalClientTimeZone } from '@deepseek-ai/dsh-util-time'
+import z from '@deepseek-ai/schemastery'
+import { installSubagentArchiveAdmission } from './archive-admission.ts'
+import { establishCatalogChild, subagentCatalogProjectionDefinition } from './catalog.ts'
+import SubagentContinuationManager from './continuation.ts'
 import type {
   SubagentInterruptReceipt,
   SubagentPromptReceipt,
   SubagentPromptRequest,
   SubagentPromptRequestId,
 } from './control-types.ts'
+import { rejectPrompt, validateControlRequest } from './control.ts'
+import { assertSubagentMaxDepth } from './depth.ts'
+import { snapshotSubagentDescriptor } from './descriptor.ts'
+import { SubagentError } from './error.ts'
+import type { SubagentDelivery } from './inbox.ts'
+import { deliverSubagentPrompt, type HostPromptContent } from './internal.ts'
+import type { ActivationObserver, LifecycleEmitter } from './lifecycle.ts'
+import { createActivationObserver, createLifecycleEmitter, observeRun } from './lifecycle.ts'
+import type { SubagentDescendantListEntry } from './list-children.ts'
+import { listChildren as listSubagentChildren, listDescendants as listSubagentDescendants } from './list-children.ts'
+import type { SubagentCatalogEntry } from './projection-types.ts'
+import { subagentIdentityProjectionDefinition, subagentTimingProjectionDefinition } from './projection.ts'
 import type {
   ContinuableCreateRequest,
   ContinuableCreateSpec,
@@ -65,58 +77,9 @@ import type {
   SubagentSendMessageOptions,
   SubagentStartRequest,
 } from './types.ts'
-import { SubagentError } from './error.ts'
-import { assertSubagentMaxDepth } from './depth.ts'
-import { createActivationObserver, createLifecycleEmitter, observeRun } from './lifecycle.ts'
-import type { ActivationObserver, LifecycleEmitter } from './lifecycle.ts'
-import SubagentContinuationManager from './continuation.ts'
-import type { SubagentDelivery } from './inbox.ts'
-import { listChildren as listSubagentChildren, listDescendants as listSubagentDescendants } from './list-children.ts'
-import type { SubagentDescendantListEntry } from './list-children.ts'
-import { installSubagentArchiveAdmission } from './archive-admission.ts'
-import { snapshotSubagentDescriptor } from './descriptor.ts'
-import { subagentIdentityProjectionDefinition, subagentTimingProjectionDefinition } from './projection.ts'
-import { establishCatalogChild, subagentCatalogProjectionDefinition } from './catalog.ts'
-import type { SubagentCatalogEntry } from './projection-types.ts'
-import { deliverSubagentPrompt } from './internal.ts'
 
-export type {} from './catalog.ts'
-export * from './out-of-process.ts'
 export { AssistantOutputFold, finalAssistantOutput } from './assistant-output.ts'
-export { SubagentRunId } from './types.ts'
-export type {
-  ContinuableCreateRequest,
-  ContinuableCreateSpec,
-  ContinuableStart,
-  ContinuableStartSpec,
-  ResolvedSubagentStartRequest,
-  SubagentCapabilities,
-  SubagentInterruptAuthority,
-  SubagentProvider,
-  SubagentResult,
-  SubagentRun,
-  SubagentSendMessageOptions,
-  SubagentStartRequest,
-  SubagentStopReason,
-  SubagentStopReasonMap,
-} from './types.ts'
-export {
-  foldSubagentDescriptor,
-  snapshotSubagentDescriptor,
-  SUBAGENT_DESCRIPTOR_VERSION,
-} from './descriptor.ts'
-export type {
-  ContinuableSubagentDescriptorData,
-  ContinuableSubagentDescriptorInput,
-  OneShotSubagentDescriptorData,
-  OneShotSubagentDescriptorInput,
-  SubagentDescriptorData,
-  SubagentDescriptorInput,
-} from './descriptor.ts'
-export type { SubagentCatalogEntry } from './projection-types.ts'
-export { SubagentError } from './error.ts'
-export { settleRun } from './run-settlement.ts'
-export { assertSubagentMaxDepth, delegationDepthOf } from './depth.ts'
+export type { } from './catalog.ts'
 export {
   appendDelegatedPolicyOverrides,
   applyChildComposition,
@@ -130,9 +93,41 @@ export {
 export type { ChildComposition, DelegatedPolicyOverrides } from './child-agent.ts'
 export type { AgentMessageSource, SubagentSettledMessageSource } from './continuation-messages.ts'
 export type * from './control-types.ts'
+export { assertSubagentMaxDepth, delegationDepthOf } from './depth.ts'
+export {
+  foldSubagentDescriptor,
+  snapshotSubagentDescriptor,
+  SUBAGENT_DESCRIPTOR_VERSION,
+} from './descriptor.ts'
+export type {
+  ContinuableSubagentDescriptorData,
+  ContinuableSubagentDescriptorInput,
+  OneShotSubagentDescriptorData,
+  OneShotSubagentDescriptorInput,
+  SubagentDescriptorData,
+  SubagentDescriptorInput,
+} from './descriptor.ts'
+export { SubagentError } from './error.ts'
 export type { SubagentDescendantListEntry } from './list-children.ts'
-export type { SubagentRunEndInfo, SubagentRunInfo } from './types.ts'
-export type { SubagentIdentityProjection, SubagentTimingProjection } from './projection-types.ts'
+export * from './out-of-process.ts'
+export type { SubagentCatalogEntry, SubagentIdentityProjection, SubagentTimingProjection } from './projection-types.ts'
+export { settleRun } from './run-settlement.ts'
+export { SubagentRunId } from './types.ts'
+export type {
+  ContinuableCreateRequest,
+  ContinuableCreateSpec,
+  ContinuableStart,
+  ContinuableStartSpec,
+  ResolvedSubagentStartRequest,
+  SubagentCapabilities,
+  SubagentInterruptAuthority,
+  SubagentProvider,
+  SubagentResult,
+  SubagentRun, SubagentRunEndInfo, SubagentRunInfo, SubagentSendMessageOptions,
+  SubagentStartRequest,
+  SubagentStopReason,
+  SubagentStopReasonMap,
+} from './types.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -289,7 +284,7 @@ export class SubagentRuntime extends TypertRemoteService {
    * widening the public Service Definition or impersonating an Agent sender.
    * @param parent - exact live direct parent authorizing delivery.
    * @param childId - durable direct-child session id.
-   * @param content - host-authored content to deliver.
+   * @param content - host-authored blocks or deferred attachment admission for a new message.
    * @param source - durable host-protocol source descriptor.
    * @param signal - caller cancellation before inbox acceptance.
    * @param delivery - Queue as a distinct turn or Steer at the nearest step.
@@ -298,7 +293,7 @@ export class SubagentRuntime extends TypertRemoteService {
   private [deliverSubagentPrompt](
     parent: Agent,
     childId: SessionId,
-    content: ContentBlock[],
+    content: HostPromptContent,
     source: MessageSource,
     signal: AbortSignal,
     delivery: SubagentDelivery,
@@ -399,12 +394,14 @@ export class SubagentRuntime extends TypertRemoteService {
    * message the child's inbox accepted; later execution is independent of this
    * call. Queue delivery targets a later turn; steer delivery targets the
    * nearest step and retains the Agent loop's best-effort fallback semantics.
+   * Reusing a request identity returns its original message id without
+   * admitting replacement content, even after claim, removal, or execution refusal.
    * Image parts are admitted and persisted through the attachment store
    * before delivery, and the child's model must accept image input.
    * Cold resume at capacity rejects with `subagent/delivery-unavailable`.
    * @param request - durable address, delivery, minted identity, content, and optional browser zone.
    * @param signal - carrier cancellation, owning the call until inbox acceptance.
-   * @returns the accepted message's inbox identity.
+   * @returns the original accepted message's inbox identity for this request.
    * @throws {RemoteError} `gateway/bad-request`, `subagent/attachment-invalid`,
    *   `subagent/invalid-time-zone`, `subagent/parent-unavailable`,
    *   `subagent/not-resumable`, `subagent/unauthorized`,
@@ -438,15 +435,15 @@ export class SubagentRuntime extends TypertRemoteService {
       ...(canonicalTimeZone === undefined ? {} : { clientTimeZone: canonicalTimeZone }),
     }
     try {
-      // Admission precedes delivery: image parts become durable references
-      // here, so the child inbox only ever accepts Host-persisted attachments.
-      let content: ContentBlock[]
+      let content: HostPromptContent
       if (request.content.every((part): part is { readonly type: 'text'; readonly text: string } => part.type === 'text')) {
         content = request.content.map(part => ({ type: 'text', text: part.text }))
       } else {
-        const attachments = this.ctx.get('attachments')
-        if (attachments === undefined) throw new Error('subagent image prompt requires an attachment store')
-        content = await attachments.admitPromptContent(request.content)
+        content = async () => {
+          const attachments = this.ctx.get('attachments')
+          if (attachments === undefined) throw new Error('subagent image prompt requires an attachment store')
+          return attachments.admitPromptContent(request.content)
+        }
       }
       return {
         messageId: await this[deliverSubagentPrompt](

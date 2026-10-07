@@ -2,14 +2,15 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { InboxState, InboxTarget } from '@deepseek-ai/dsh-agent/types'
-import { randomUUID } from '@deepseek-ai/dsh-util-crypto'
+import { isRemoteFailure } from '@deepseek-ai/dsh-api-gateway/client'
 import type { AttachmentIdType, FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import type { SubagentAddress } from '@deepseek-ai/dsh-subagent/client'
 import type { MessageId } from '@deepseek-ai/dsh-llm/brand'
 import type { UserMessage } from '@deepseek-ai/dsh-llm/types'
 import { SessionLogOffset, SessionSeq, type SessionId } from '@deepseek-ai/dsh-session/types'
-import { SessionEventStream } from '../transport.ts'
-import type { SessionJournalChange } from '../transport.ts'
+import type { SubagentAddress } from '@deepseek-ai/dsh-subagent/client'
+import type { RemoteFailure, RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
+import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
+import { randomUUID } from '@deepseek-ai/dsh-util-crypto'
 import type {
   PromptContentPart,
   QueueAction,
@@ -18,28 +19,23 @@ import type {
   SessionProjectionBaseline,
   SessionRequestId,
 } from '../../types.ts'
-import type {
-  BeginSubmissionInput, PendingSubmissionRetirement, SessionFace, SubmissionHandle,
-} from '../contract/session.ts'
-import type {
-  OpenState, PendingSubmission, PromptError, SessionSnapshot,
-} from '../contract/snapshot.ts'
+import type { SessionEventLike, SessionEventLikeEntry, SessionLiveEventEntry } from '../contract/events.ts'
 import { MutableSessionEventSource } from '../contract/events.ts'
 import type {
-  SessionEventLike, SessionEventLikeEntry, SessionLiveEventEntry,
-} from '../contract/events.ts'
-import { Notifier } from './notifier.ts'
-import { isRemoteFailure } from '@deepseek-ai/dsh-api-gateway/client'
-import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
-import type { RemoteFailure, RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import type { SessionRemotes } from './remotes.ts'
-import { ProjectionValueStore } from './projection-store.ts'
-import type { ProjectionsBaseline } from './projection-store.ts'
+  BeginSubmissionInput,
+  PendingSubmissionRetirement,
+  SessionFace,
+  SubmissionHandle,
+} from '../contract/session.ts'
+import type { OpenState, PendingSubmission, PromptError, SessionSnapshot } from '../contract/snapshot.ts'
 import { resolvedClientTimeZone } from '../time-zone.ts'
-import {
-  ClientAssistantStream,
-  type ClientAssistantStreamResult,
-} from './assistant-stream.ts'
+import type { SessionJournalChange } from '../transport.ts'
+import { SessionEventStream } from '../transport.ts'
+import { ClientAssistantStream, type ClientAssistantStreamResult } from './assistant-stream.ts'
+import { Notifier } from './notifier.ts'
+import type { ProjectionsBaseline } from './projection-store.ts'
+import { ProjectionValueStore } from './projection-store.ts'
+import type { SessionRemotes } from './remotes.ts'
 
 function projectionsBaseline(value: SessionProjectionBaseline): ProjectionsBaseline {
   return {
@@ -248,7 +244,8 @@ export class Session implements SessionFace {
    * @param content - text, browser-owned temporary image uploads, and staged-file receipts.
    * @param mode - queue appends after the current turn; steer interrupts it.
    * @param signal - optional caller cancellation for the complete admission round-trip.
-   * @param requestId - identity from {@link beginSubmission}; a failed identified prompt retires its echo.
+   * @param requestId - caller identity forwarded to root or child prompts; omitted identities are generated.
+   * A failed identified prompt retires its echo.
    * @returns the prompt result (also mirrored into promptError on failure).
    */
   async prompt(
@@ -289,7 +286,7 @@ export class Session implements SessionFace {
       // wire type is used; this array is not filtered or reordered.
       const routedContent = content as Exclude<PromptContentPart, { readonly type: 'file' }>[]
       const routed = await this.remote.subagents.prompt({
-        requestId: randomUUID() as SessionRequestId,
+        requestId: requestId ?? randomUUID() as SessionRequestId,
         parentSessionId: this.address.parentSessionId,
         childSessionId: this.address.childSessionId,
         mode: 'continuable',

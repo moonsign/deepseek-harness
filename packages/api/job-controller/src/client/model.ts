@@ -28,14 +28,21 @@ export interface ObservedJob {
   readonly error?: string
 }
 
+/** Readiness of a watched session's last received whole-set roster. */
+export type JobRosterState =
+  | { readonly state: 'loading' | 'ready'; readonly error: null }
+  | { readonly state: 'error'; readonly error: string }
+
 /** Immutable client job state. */
 export interface JobsSnapshot {
   /**
-   * The jobs each watched session can see, keyed by session id. A session
-   * nobody watches, or one that sees no job, has no key, so consumers read
-   * absence rather than a sentinel.
+   * Last received visible jobs by session id, including an empty array.
+   * Loading and failed rosters retain their last received rows; absence means
+   * no baseline has arrived or nobody watches that session.
    */
   readonly rows: Readonly<Record<string, readonly JobView[]>>
+  /** Readiness by watched session id; a ready object persists until readiness is lost. */
+  readonly rosterStatus: Readonly<Record<string, JobRosterState>>
   /** Live observation state keyed by job id. */
   readonly observed: Readonly<Record<string, ObservedJob>>
 }
@@ -62,18 +69,21 @@ interface ObservedState {
 /** Owns the per-session rosters and per-job observation state. */
 export class ClientJobsModel implements JobsSource {
   private readonly rowsBySession = new Map<string, readonly JobView[]>()
+  private readonly rosterStates = new Map<string, JobRosterState>()
   private readonly observedStates = new Map<string, ObservedState>()
   private readonly listeners = new Set<() => void>()
-  private snapshotCache: JobsSnapshot = { rows: {}, observed: {} }
+  private snapshotCache: JobsSnapshot = { rows: {}, rosterStatus: {}, observed: {} }
   private snapshotDirty = false
 
   getSnapshot(): JobsSnapshot {
     if (this.snapshotDirty) {
       const rows: Record<string, readonly JobView[]> = {}
       for (const [id, jobs] of this.rowsBySession) rows[id] = jobs
+      const rosterStatus: Record<string, JobRosterState> = {}
+      for (const [id, status] of this.rosterStates) rosterStatus[id] = status
       const observed: Record<string, ObservedJob> = {}
       for (const [id, state] of this.observedStates) observed[id] = state.view
-      this.snapshotCache = { rows, observed }
+      this.snapshotCache = { rows, rosterStatus, observed }
       this.snapshotDirty = false
     }
     return this.snapshotCache
@@ -81,31 +91,62 @@ export class ClientJobsModel implements JobsSource {
 
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener)
-    return () => { this.listeners.delete(listener) }
+    return () => {
+      this.listeners.delete(listener)
+    }
   }
 
   /**
-   * Replace one session's roster with a `rows` frame's whole set. An empty
-   * set is stored as an absent key.
+   * Mark an opening roster unavailable while retaining its last received rows.
+   * @param sessionId - the watched session.
+   * @param fresh - discard a retired owner's baseline before the first watch.
+   */
+  rowsLoading(sessionId: SessionId, fresh = false): void {
+    const key = String(sessionId)
+    const dropped = fresh && this.rowsBySession.delete(key)
+    if (!dropped && this.rosterStates.get(key)?.state === 'loading') return
+    this.rosterStates.set(key, { state: 'loading', error: null })
+    this.changed()
+  }
+
+  /**
+   * Replace one session's roster with a received whole set and mark it ready.
    * @param sessionId - the watched session.
    * @param jobs - the complete visible set.
    */
   rowsReplaced(sessionId: SessionId, jobs: readonly JobView[]): void {
     const key = String(sessionId)
-    if (jobs.length === 0) {
-      if (!this.rowsBySession.delete(key)) return
-    } else {
-      this.rowsBySession.set(key, jobs)
-    }
+    this.rowsBySession.set(key, jobs)
+    if (this.rosterStates.get(key)?.state !== 'ready') this.rosterStates.set(key, { state: 'ready', error: null })
     this.changed()
   }
 
   /**
-   * Drop one session's roster after its last watcher stops or its stream fails.
+   * Record terminal roster failure without discarding a received baseline.
+   * @param sessionId - the watched session.
+   * @param error - terminal failure rendered as diagnostic text.
+   */
+  rowsFailed(sessionId: SessionId, error: unknown): void {
+    this.rosterStates.set(String(sessionId), { state: 'error', error: String(error) })
+    this.changed()
+  }
+
+  /**
+   * Drop one session's roster and readiness after its last watcher stops.
    * @param sessionId - the no-longer-watched session.
    */
   rowsDropped(sessionId: SessionId): void {
-    if (!this.rowsBySession.delete(String(sessionId))) return
+    const rows = this.rowsBySession.delete(String(sessionId))
+    const status = this.rosterStates.delete(String(sessionId))
+    if (!rows && !status) return
+    this.changed()
+  }
+
+  /** Clear active and retiring roster state when its service is disposed. */
+  rowsCleared(): void {
+    if (this.rowsBySession.size === 0 && this.rosterStates.size === 0) return
+    this.rowsBySession.clear()
+    this.rosterStates.clear()
     this.changed()
   }
 
@@ -150,13 +191,13 @@ export class ClientJobsModel implements JobsSource {
     /* v8 ignore next -- frames arrive only between opened and stop for a tracked id. */
     if (state === undefined) return
     let text = state.view.text + frame.chunks.map(chunk => chunk.text).join('')
-    let gapBefore = state.view.gapBefore || frame.lossy === true
-      || frame.chunks.some(chunk => chunk.gapBefore === true)
+    let gapBefore =
+      state.view.gapBefore || frame.lossy === true || frame.chunks.some(chunk => chunk.gapBefore === true)
     if (text.length > RENDER_TAIL_LIMIT) {
       let cut = text.length - RENDER_TAIL_LIMIT
       // Never split a surrogate pair at the render bound.
       const unit = text.charCodeAt(cut)
-      if (unit >= 0xDC00 && unit <= 0xDFFF) cut += 1
+      if (unit >= 0xdc00 && unit <= 0xdfff) cut += 1
       text = text.slice(cut)
       gapBefore = true
     }

@@ -1,22 +1,25 @@
+import type {} from '@deepseek-ai/dsh-agent-preset-registry'
+import { SessionId } from '@deepseek-ai/dsh-session'
+import type {} from '@deepseek-ai/dsh-skill'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it } from 'vitest'
-import type {} from '@deepseek-ai/dsh-skill'
-import { SessionId } from '@deepseek-ai/dsh-session'
-import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 import { launchWebScaffold, type WebScaffold } from './scaffold.ts'
 
 async function writeSkill(root: string, name: string): Promise<void> {
   const bundle = join(root, name)
   await mkdir(bundle, { recursive: true })
-  await writeFile(join(bundle, 'SKILL.md'), `---
+  await writeFile(
+    join(bundle, 'SKILL.md'),
+    `---
 name: ${name}
 description: Must not enter the Web replay scaffold
 ---
 
 Ambient host state.
-`)
+`,
+  )
 }
 
 it('isolates replay skill discovery from every ambient host root', async () => {
@@ -40,6 +43,9 @@ it('isolates replay skill discovery from every ambient host root', async () => {
   try {
     scaffold = await launchWebScaffold()
     const ctx = scaffold.ctx
+    expect(
+      ctx.clientModules.graph().entries.map(entry => entry.id),
+    ).toContain('@deepseek-ai/dsh-client-ui-directory-picker-browse')
     // Local skill discovery belongs to the agent's preset LAYER of the host
     // registry, so the roots under test are only reachable through a composed
     // agent's view — the same scope the `skills/list` Remote resolves for a
@@ -70,5 +76,17 @@ it('isolates replay skill discovery from every ambient host root', async () => {
       else process.env.DSH_BUNDLED_SKILL_DIR = originalBundled
       await rm(ambient, { recursive: true, force: true })
     }
+  }
+})
+
+it('retains the deterministic directory backend when its stock Client view is omitted', async () => {
+  const scaffold = await launchWebScaffold({ directoryPickerUI: false })
+  try {
+    expect(scaffold.ctx.directoryPicker).toBeDefined()
+    expect(
+      scaffold.ctx.clientModules.graph().entries.map(entry => entry.id),
+    ).not.toContain('@deepseek-ai/dsh-client-ui-directory-picker-browse')
+  } finally {
+    await scaffold.close()
   }
 })

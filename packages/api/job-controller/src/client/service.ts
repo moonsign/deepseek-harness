@@ -8,11 +8,18 @@
  */
 
 import { Service, type Context } from '@deepseek-ai/cordis'
-import { RemoteStreamCarrierError, type ClientRemote } from '@deepseek-ai/dsh-api-gateway/client'
-import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
+import { RemoteStreamCarrierError, type ClientRemote, type RemoteStream } from '@deepseek-ai/dsh-api-gateway/client'
 import type { JobId } from '@deepseek-ai/dsh-jobs/brand'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import type { JobKillRequest, JobKillValue, JobFollowFrame, JobFollowRequest, JobListFrame, JobListRequest } from '../types.ts'
+import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
+import type {
+  JobFollowFrame,
+  JobFollowRequest,
+  JobKillRequest,
+  JobKillValue,
+  JobListFrame,
+  JobListRequest,
+} from '../types.ts'
 import type { ClientJobsModel, JobsSource } from './model.ts'
 
 /** The generated `job` namespace face the stream runners drive. */
@@ -57,6 +64,13 @@ export interface IJobs {
    */
   watchRows(sessionId: SessionId): () => void
   /**
+   * Retry a terminally failed watched roster, retaining its last received rows.
+   * Loading, ready, unwatched and disposed rosters are unchanged; repeated
+   * calls share one replacement and create no watcher.
+   * @param sessionId - the watched session to retry.
+   */
+  retryRows(sessionId: SessionId): void
+  /**
    * Start observing one job's live output; reference-counted, so two viewers
    * of the same job share one stream.
    * @param sessionId - owning session used for the fenced read; undefined for an unowned job.
@@ -82,6 +96,19 @@ interface StreamEntry {
   dispose: () => Promise<void>
 }
 
+/** Watch references outlive failed roster streams and bind their exact owner. */
+interface RosterOwner {
+  refs: number
+  generation: RosterGeneration
+}
+
+/** One logical Gateway stream, including all of its physical carrier retries. */
+interface RosterGeneration {
+  failed: boolean
+  stream?: RemoteStream<JobListFrame>
+  closing?: Promise<void>
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Context {
     /** React-free client job rosters and observation control. */
@@ -92,8 +119,10 @@ declare module '@deepseek-ai/cordis' {
 /** Owns the bare jobs snapshot and the per-session and per-job streams. */
 export class ClientJobs extends Service implements IJobs {
   readonly state: JobsSource
-  private readonly rowsEntries = new Map<string, StreamEntry>()
+  private readonly rowsEntries = new Map<SessionId, RosterOwner>()
+  private readonly rowTasks = new Set<Promise<void>>()
   private readonly observations = new Map<string, StreamEntry>()
+  private disposed = false
 
   /**
    * @param ctx - client root Context.
@@ -107,17 +136,27 @@ export class ClientJobs extends Service implements IJobs {
   ) {
     super(ctx, 'jobs')
     this.state = model
-    ctx.effect(() => async () => {
-      const open = [...this.rowsEntries.values(), ...this.observations.values()]
-      this.rowsEntries.clear()
-      this.observations.clear()
-      for (const entry of open) entry.stopped = true
-      // Cordis awaits an async disposer, so the fiber stays unloading until
-      // every carrier iterator has closed and a successor plugin instance
-      // cannot overlap one. A carrier whose teardown fails is stopped all the
-      // same; its failure has no consumer here.
-      await Promise.allSettled(open.map(entry => entry.dispose()))
-    }, 'job-controller.client.streams')
+    ctx.effect(
+      () => async () => {
+        this.disposed = true
+        const rows = [...this.rowsEntries.entries()]
+        const open = [...this.observations.values()]
+        this.rowsEntries.clear()
+        this.observations.clear()
+        this.model.rowsCleared()
+        for (const entry of open) entry.stopped = true
+        // Cordis awaits an async disposer, so the fiber stays unloading until
+        // every carrier iterator has closed and a successor plugin instance
+        // cannot overlap one. A carrier whose teardown fails is stopped all the
+        // same; its failure has no consumer here.
+        await Promise.allSettled([
+          ...rows.map(([, owner]) => this.closeRows(owner.generation)),
+          ...this.rowTasks,
+          ...open.map(entry => entry.dispose()),
+        ])
+      },
+      'job-controller.client.streams',
+    )
   }
 
   kill(sessionId: SessionId, id: JobId): Promise<RemoteResult<JobKillValue>> {
@@ -125,20 +164,47 @@ export class ClientJobs extends Service implements IJobs {
   }
 
   watchRows(sessionId: SessionId): () => void {
-    return this.acquire(
-      this.rowsEntries,
-      String(sessionId),
-      () => this.startRows(sessionId),
-      () => { this.model.rowsDropped(sessionId) },
-    )
+    if (this.disposed) return () => {}
+    let owner = this.rowsEntries.get(sessionId)
+    if (owner === undefined) {
+      owner = { refs: 1, generation: { failed: false } }
+      this.rowsEntries.set(sessionId, owner)
+      this.startRows(sessionId, owner, true)
+    } else {
+      owner.refs++
+      this.retryRows(sessionId)
+    }
+    const held = owner
+    let released = false
+    return () => {
+      if (released || this.rowsEntries.get(sessionId) !== held) return
+      released = true
+      if (--held.refs > 0) return
+      this.rowsEntries.delete(sessionId)
+      const closing = this.closeRows(held.generation)
+      void Promise.allSettled([closing]).then(() => {
+        if (!this.rowsEntries.has(sessionId)) this.model.rowsDropped(sessionId)
+      })
+    }
+  }
+
+  retryRows(sessionId: SessionId): void {
+    const owner = this.rowsEntries.get(sessionId)
+    if (this.disposed || owner?.generation.failed !== true) return
+    const predecessor = owner.generation
+    owner.generation = { failed: false }
+    this.startRows(sessionId, owner, false, predecessor)
   }
 
   observe(sessionId: SessionId | undefined, id: JobId): () => void {
+    if (this.disposed) return () => {}
     return this.acquire(
       this.observations,
       String(id),
       () => this.startObservation(sessionId, id),
-      () => { this.model.observeStopped(id) },
+      () => {
+        this.model.observeStopped(id)
+      },
     )
   }
 
@@ -165,7 +231,12 @@ export class ClientJobs extends Service implements IJobs {
    * a stopped entry, and decrementing or disposing through the key alone
    * would tear down that newer stream's references.
    */
-  private releaser(entries: Map<string, StreamEntry>, key: string, entry: StreamEntry, cleared: () => void): () => void {
+  private releaser(
+    entries: Map<string, StreamEntry>,
+    key: string,
+    entry: StreamEntry,
+    cleared: () => void,
+  ): () => void {
     let released = false
     return () => {
       if (released) return
@@ -184,40 +255,65 @@ export class ClientJobs extends Service implements IJobs {
     }
   }
 
-  private startRows(sessionId: SessionId): StreamEntry {
+  private rowsCurrent(sessionId: SessionId, owner: RosterOwner, generation: RosterGeneration): boolean {
+    return !this.disposed && this.rowsEntries.get(sessionId) === owner && owner.generation === generation
+  }
+
+  private closeRows(generation: RosterGeneration): Promise<void> {
+    if (generation.stream === undefined) return Promise.resolve()
+    generation.closing ??= generation.stream.dispose()
+    return generation.closing
+  }
+
+  private startRows(sessionId: SessionId, owner: RosterOwner, fresh: boolean, predecessor?: RosterGeneration): void {
     const name = `job rows ${String(sessionId)}`
-    const stream = this.remote.$stream<JobListFrame>({
-      name,
-      open: signal => this.remote.job.list({ sessionId }, signal),
-      // The roster has no natural end while it is watched: an end after the
-      // first frame is a carrier interruption (a Host reload closes the
-      // generation) and the next generation's whole set loses nothing. An end
-      // before the first frame is terminal.
-      ended: accepted => accepted
-        ? new RemoteStreamCarrierError(`${name} ended before release`)
-        : new Error(`${name} ended before its first frame`),
-    })
-    const entry: StreamEntry = {
-      refs: 1,
-      stopped: false,
-      dispose: () => stream.dispose(),
-    }
-    void (async () => {
+    const generation = owner.generation
+    // Publish only after installing both owners: notifications may release
+    // this watch, re-watch, retry or dispose the service synchronously.
+    this.model.rowsLoading(sessionId, fresh)
+    if (!this.rowsCurrent(sessionId, owner, generation)) return
+    const task = (async () => {
       try {
+        if (predecessor !== undefined) await this.closeRows(predecessor)
+        if (!this.rowsCurrent(sessionId, owner, generation)) return
+        const stream = this.remote.$stream<JobListFrame>({
+          name,
+          open: (signal) => {
+            if (this.rowsCurrent(sessionId, owner, generation)) this.model.rowsLoading(sessionId)
+            signal.throwIfAborted()
+            if (!this.rowsCurrent(sessionId, owner, generation)) throw new Error(`${name} released before open`)
+            return this.remote.job.list({ sessionId }, signal)
+          },
+          carrierFailed: () => {
+            if (this.rowsCurrent(sessionId, owner, generation)) this.model.rowsLoading(sessionId)
+          },
+          // A watched roster has no natural end. After a baseline, reconnect
+          // can replace it whole; ending before a baseline is terminal.
+          ended: accepted =>
+            accepted
+              ? new RemoteStreamCarrierError(`${name} ended before release`)
+              : new Error(`${name} ended before its first frame`),
+        })
+        generation.stream = stream
+        if (!this.rowsCurrent(sessionId, owner, generation)) return
         for await (const item of stream) {
+          if (!this.rowsCurrent(sessionId, owner, generation) || item.signal.aborted) continue
           this.model.rowsReplaced(sessionId, item.value.jobs)
           item.accept()
         }
-      } catch {
-        // A terminal stream failure leaves nothing current to show; the model
-        // drops the roster rather than keeping a stale set on screen.
-        if (!entry.stopped) this.model.rowsDropped(sessionId)
+      } catch (error) {
+        if (this.rowsCurrent(sessionId, owner, generation)) {
+          generation.failed = true
+          this.model.rowsFailed(sessionId, error)
+        }
       } finally {
-        entry.stopped = true
-        void entry.dispose()
+        await Promise.allSettled([this.closeRows(generation)])
       }
     })()
-    return entry
+    this.rowTasks.add(task)
+    void task.then(() => {
+      this.rowTasks.delete(task)
+    })
   }
 
   private startObservation(sessionId: SessionId | undefined, id: JobId): StreamEntry {
@@ -229,8 +325,8 @@ export class ClientJobs extends Service implements IJobs {
         return this.remote.job.follow(
           {
             jobId: id,
-            ...sessionId !== undefined ? { sessionId } : {},
-            ...from !== undefined ? { from } : {},
+            ...(sessionId !== undefined ? { sessionId } : {}),
+            ...(from !== undefined ? { from } : {}),
           },
           signal,
         )
@@ -238,9 +334,10 @@ export class ClientJobs extends Service implements IJobs {
       // A premature end after the anchor is retryable (a Host reload closes the
       // generation); resuming from the cursor loses nothing. An end before the
       // anchor is terminal.
-      ended: accepted => accepted
-        ? new RemoteStreamCarrierError(`${name} ended before settlement`)
-        : new Error(`${name} ended before its anchor`),
+      ended: accepted =>
+        accepted
+          ? new RemoteStreamCarrierError(`${name} ended before settlement`)
+          : new Error(`${name} ended before its anchor`),
     })
     const entry: StreamEntry = {
       refs: 1,

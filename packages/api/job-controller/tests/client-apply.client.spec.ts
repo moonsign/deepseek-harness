@@ -1,6 +1,6 @@
 import { Context } from '@deepseek-ai/cordis'
-import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
 import { RemoteStream, type RemoteStreamOptions } from '@deepseek-ai/dsh-api-gateway/client'
+import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { afterEach, describe, expect, it } from 'vitest'
 import * as JobClient from '../src/client/index.ts'
@@ -9,7 +9,11 @@ import type { JobFollowFrame, JobListFrame } from '../src/types.ts'
 const contexts = new Set<Context>()
 
 afterEach(async () => {
-  await Promise.all([...contexts].map(async (ctx) => { await ctx.fiber.dispose() }))
+  await Promise.all(
+    [...contexts].map(async (ctx) => {
+      await ctx.fiber.dispose()
+    }),
+  )
   contexts.clear()
 })
 
@@ -73,13 +77,15 @@ describe('Job Controller Client apply', () => {
     stopRows()
     stopObserve()
     await flush()
-    expect(ctx.jobs.state.getSnapshot()).toEqual({ rows: {}, observed: {} })
+    expect(ctx.jobs.state.getSnapshot()).toEqual({ rows: {}, rosterStatus: {}, observed: {} })
   })
 
-  it('forwards a kill to the job namespace with the row\'s session', async () => {
+  it("forwards a kill to the job namespace with the row's session", async () => {
     const { ctx, killCalls } = await mount()
-    await expect(ctx.jobs.kill('session-1' as SessionId, 'bash-1' as never))
-      .resolves.toEqual({ ok: true, value: { outcome: 'requested' } })
+    await expect(ctx.jobs.kill('session-1' as SessionId, 'bash-1' as never)).resolves.toEqual({
+      ok: true,
+      value: { outcome: 'requested' },
+    })
     expect(killCalls).toEqual([{ sessionId: 'session-1', jobId: 'bash-1' }])
   })
 })

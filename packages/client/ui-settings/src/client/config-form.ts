@@ -1,32 +1,18 @@
 /** Shared entry values and ordered writes over the Host configuration mirror. */
 
-import { DeveloperToolsPreference } from './developer-tools.ts'
-import { DEVELOPER_TOOLS_NAMESPACE } from '../developer-tools-settings.ts'
-import { Service } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
-import type {
-  SettingsNamespaceView, SettingsPathOpView,
-} from '@deepseek-ai/dsh-api-remotes/client'
+import { Service } from '@deepseek-ai/cordis'
+import type { RemoteResult, SettingsNamespaceView, SettingsPathOpView } from '@deepseek-ai/dsh-api-remotes/client'
 import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
-// Type-only, and deliberately NOT `@deepseek-ai/dsh-api-remotes/client`: this
-// package is reachable from the Host build graph through its feature-package
-// callers, and api-remotes' Client face imports a Host-tsdown-generated
-// `/remote` artifact, which would deadlock the Host tsc phase. The gateway's
-// Client half declares `ctx.remote` with no generated import, and the
-// allowlist's `types` subpath is a pure-type source file, so the pair supplies
-// `$on` and its key face without dragging a build artifact in. The runtime
-// `remote` injection belongs to the providing plugin's apply, which registers
-// the mirror's invalidation subscriptions.
-import type {} from '@deepseek-ai/dsh-api-remotes/client'
+import { DEVELOPER_TOOLS_NAMESPACE } from '../developer-tools-settings.ts'
+import { DeveloperToolsPreference } from './developer-tools.ts'
+// The allowlist and event declaration jointly type forwarded settings events.
+// The providing plugin owns runtime Remote injection and invalidation subscriptions.
 import type {} from '@deepseek-ai/dsh-api-remotes/types'
-// The forwarded event's own declaration: `$on`'s key face is
-// `Extract<keyof Events, keyof Selection>`, so the allowlist alone resolves to
-// never — the owning package's client-safe, type-only subpath supplies the
-// cordis `Events` entry (and with it the branded `SettingsNamespace`).
 import type {} from '@deepseek-ai/dsh-settings/types'
-import type { SettingsSchemaService } from './schema.ts'
 import type { ConfigForm, ConfigFormSnapshot } from './config-form-types.ts'
+import type { SettingsSchemaService } from './schema.ts'
 import { SettingsDescribeMirror, type SettingsDescribeFace } from './settings-mirror.ts'
 
 /** Domain-owned description of one settings namespace consumed by a browser plugin. */
@@ -85,7 +71,9 @@ export class ConfigFormController<T> implements ConfigForm<T> {
       mode: persistence,
     })
     if (persistence === 'host') {
-      this.unsubscribe = mirror.subscribe(() => { this.derive() })
+      this.unsubscribe = mirror.subscribe(() => {
+        this.derive()
+      })
       this.derive()
     }
   }
@@ -131,24 +119,38 @@ export class ConfigFormController<T> implements ConfigForm<T> {
    * @param expectedRevision - optional fixed revision read by the domain editor.
    * @returns whether the Host accepted the mutation, after any recovery read.
    */
-  mutate(ops: readonly SettingsPathOpView[], expectedRevision?: number): Promise<boolean> {
-    const ownedOps = structuredClone(ops) as SettingsPathOpView[]
+  async mutate(ops: readonly SettingsPathOpView[], expectedRevision?: number): Promise<boolean> {
+    const result = await this.mutateResult(ops, expectedRevision)
+    return result?.ok === true
+  }
+
+  /**
+   * Queue one atomic namespace mutation with its original Remote result; see {@link ConfigForm.mutateResult}.
+   * @param ops - ordered field operations copied when queued.
+   * @param expectedRevision - optional fixed revision read by the domain editor.
+   * @returns the Remote answer after any recovery, or undefined for a local skip.
+   */
+  mutateResult(
+    ops: readonly SettingsPathOpView[],
+    expectedRevision?: number,
+  ): Promise<RemoteResult<SettingsNamespaceView> | undefined> {
+    const ownedOps = structuredClone([...ops])
     const generation = ++this.writeGeneration
     return this.enqueue(async () => {
       const revision = expectedRevision ?? this.pendingRevision ?? this.getSnapshot().revision
       const response = await this.ctx.remote.settings.mutate(this.spec.namespace, ownedOps, revision)
       if (!response.ok) {
         await this.recover(generation)
-        return false
+        return response
       }
-      if (this.disposed) return true
+      if (this.disposed) return response
       if (generation === this.writeGeneration) {
         this.pendingRevision = undefined
         this.mirror.acceptView(response.value)
       } else {
         this.pendingRevision = response.value.revision
       }
-      return true
+      return response
     })
   }
 
@@ -171,15 +173,20 @@ export class ConfigFormController<T> implements ConfigForm<T> {
     await this.tail
   }
 
-  private enqueue(operation: () => Promise<boolean>): Promise<boolean> {
-    if (this.persistence === 'memory' || this.disposed) return Promise.resolve(false)
+  private enqueue(
+    operation: () => Promise<RemoteResult<SettingsNamespaceView>>,
+  ): Promise<RemoteResult<SettingsNamespaceView> | undefined> {
+    if (this.persistence === 'memory' || this.disposed) return Promise.resolve(undefined)
     const task = this.tail.then(async () => {
-      if (this.disposed) return false
+      if (this.disposed) return undefined
       return await operation()
     })
     // The returned task carries its own settlement to the caller; the queue
     // tail is kept fulfilled so one failed subscriber cannot strand later operations.
-    this.tail = task.then(() => {}, () => {})
+    this.tail = task.then(
+      () => {},
+      () => {},
+    )
     return task
   }
 
@@ -221,7 +228,7 @@ export class ConfigFormController<T> implements ConfigForm<T> {
       // the value is treated exactly like a schema-invalid one.
       return undefined
     }
-    return failure === undefined ? view.value as T : undefined
+    return failure === undefined ? (view.value as T) : undefined
   }
 }
 
@@ -258,21 +265,27 @@ export class ConfigForms extends Service {
    * the settings-owned schema operations, and the Host persistence the provider
    * resolved from `remote.$host`.
    */
-  constructor(ctx: Context, config: {
-    mirror: SettingsDescribeMirror
-    schema: SettingsSchemaService
-    persistence: 'host' | 'memory'
-  }) {
+  constructor(
+    ctx: Context,
+    config: {
+      mirror: SettingsDescribeMirror
+      schema: SettingsSchemaService
+      persistence: 'host' | 'memory'
+    },
+  ) {
     super(ctx, 'configForms')
     this.mirror = config.mirror
     this.schema = config.schema
     this.persistence = config.persistence
     this.owner = ctx
     this.developerTools = new DeveloperToolsPreference(this.get(DEVELOPER_TOOLS_NAMESPACE))
-    ctx.effect(() => async () => {
-      await Promise.all([...this.forms.values()].map(form => form.dispose()))
-      this.forms.clear()
-    }, 'ui-settings: configuration forms')
+    ctx.effect(
+      () => async () => {
+        await Promise.all([...this.forms.values()].map(form => form.dispose()))
+        this.forms.clear()
+      },
+      'ui-settings: configuration forms',
+    )
   }
 
   /**
@@ -294,7 +307,11 @@ export class ConfigForms extends Service {
     const existing = this.forms.get(entryId)
     if (existing !== undefined) return existing as ConfigFormController<T>
     const form = new ConfigFormController<T>(
-      this.owner, { namespace: entryId }, this.mirror, this.persistence, this.schema,
+      this.owner,
+      { namespace: entryId },
+      this.mirror,
+      this.persistence,
+      this.schema,
     )
     this.forms.set(entryId, form)
     void this.mirror.ensure()

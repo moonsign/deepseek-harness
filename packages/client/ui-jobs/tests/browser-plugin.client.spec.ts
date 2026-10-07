@@ -3,24 +3,23 @@
  * registrations against the real SlotRegistry (with fiber teardown proving
  * removal — HMR safety), and the inert node entry.
  */
-import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import { Context } from '@deepseek-ai/cordis'
+import type { JobsSnapshot } from '@deepseek-ai/dsh-api-job-controller/client'
+import { apply as applyLocale, inject as localeInject } from '@deepseek-ai/dsh-client-locale/client'
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
+import { stubConfigForm } from '@deepseek-ai/dsh-client-test-runtime'
+import { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { JobId } from '@deepseek-ai/dsh-jobs/brand'
 import { SessionId } from '@deepseek-ai/dsh-session/types'
 import { describe, expect, it } from 'vitest'
-import { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
-import { stubConfigForm } from '@deepseek-ai/dsh-client-test-runtime'
-import { apply as applyLocale, inject as localeInject } from '@deepseek-ai/dsh-client-locale/client'
 import { apply, inject } from '../src/client/index.ts'
 import type { JobListInjected } from '../src/client/JobListAction.tsx'
-import { apply as applyNode } from '../src/index.ts'
 import { en, NS, zh } from '../src/client/locales.ts'
+import { apply as applyNode } from '../src/index.ts'
 
 /** Slot ledger reader: entry ids currently registered in the header list. */
 function headerEntryIds(ctx: Context): (string | undefined)[] {
-  return ctx.slots
-    .entries('conversation.session.header.actions')
-    .map(entry => entry.options.id)
+  return ctx.slots.entries('conversation.session.header.actions').map(entry => entry.options.id)
 }
 
 /** Observation requests handed to the stubbed jobs service. */
@@ -33,20 +32,44 @@ const kills: [string, string][] = []
 let killResult: { ok: boolean } = { ok: true }
 
 /** Boot the browser half over a real slot tree that declares the header list. */
-async function bench(): Promise<{ ctx: Context; fiber: ReturnType<Context['plugin']> }> {
+async function bench(): Promise<{
+  ctx: Context
+  fiber: ReturnType<Context['plugin']>
+  state: ReturnType<typeof createSnapshotStore<JobsSnapshot>>
+}> {
   const ctx = new Context()
   await ctx.plugin(SlotRegistry).await()
-  ctx.slots.register({
-    name: 'root',
-    children: {
-      'conversation.session.header.actions': { kind: 'list', scope: 'session' },
+  ctx.slots.register(
+    {
+      name: 'root',
+      children: {
+        'conversation.session.header.actions': { kind: 'list', scope: 'session' },
+      },
+    } as never,
+    () => null,
+  )
+  const state = createSnapshotStore<JobsSnapshot>({
+    rows: {
+      'sess-live': ['bash-3', 'bash-4'].map(id => ({
+        id: JobId(id),
+        kind: 'bash',
+        label: id,
+        status: 'running',
+        startedAt: 1,
+        output: { total: 0, earliest: 0 },
+      })),
     },
-  } as never, () => null)
+    rosterStatus: { 'sess-live': { state: 'ready', error: null } },
+    observed: {},
+  })
   ctx.provide('jobs', {
-    state: { getSnapshot: () => ({ rows: {}, observed: {} }), subscribe: () => () => {} },
+    state,
     watchRows: (sessionId: string) => {
       watched.push(sessionId)
       return () => {}
+    },
+    retryRows: (sessionId: string) => {
+      watched.push(`retry:${sessionId}`)
     },
     observe: (sessionId: string | undefined, id: string) => {
       observed.push([sessionId, id])
@@ -61,7 +84,10 @@ async function bench(): Promise<{ ctx: Context; fiber: ReturnType<Context['plugi
   // and the forwarded-event port.
   ctx.provide('connection', { api: { settings: {} }, isLoopback: false } as never)
   ctx.provide('remote', { $on: () => () => {} } as never)
-  ctx.provide('configForms', { developerTools: { enabled: createSnapshotStore(true) }, get: () => stubConfigForm().scope } as never)
+  ctx.provide('configForms', {
+    developerTools: { enabled: createSnapshotStore(true) },
+    get: () => stubConfigForm().scope,
+  } as never)
   await ctx.plugin({ inject: localeInject, apply: applyLocale }).await()
   // These specs assert the shipped Chinese copy. There is no jsdom `window` in
   // this lane, so browser-language detection never runs and the locale comes
@@ -69,7 +95,7 @@ async function bench(): Promise<{ ctx: Context; fiber: ReturnType<Context['plugi
   ctx.locale.setLocale('zh')
   const fiber = ctx.plugin({ inject: [...inject], apply })
   await fiber.await()
-  return { ctx, fiber }
+  return { ctx, fiber, state }
 }
 
 describe('ui-jobs browser half', () => {
@@ -86,8 +112,11 @@ describe('ui-jobs browser half', () => {
     if (inject === undefined) throw new Error('job-list entry registered no inject face')
     const face = inject()
     expect(face.hooks.jobs).toBeDefined()
+    expect(face.readJobs()).toBe(ctx.jobs.state.getSnapshot())
     const release = face.watchRows(SessionId('session'))
     expect(watched).toEqual(['session'])
+    face.retryRows(SessionId('session'))
+    expect(watched).toEqual(['session', 'retry:session'])
     release()
     const stopper = face.observe(SessionId('session'), JobId('bash-1'))
     expect(observed).toEqual([['session', 'bash-1']])
@@ -99,7 +128,29 @@ describe('ui-jobs browser half', () => {
     await expect(face.killJob(SessionId('sess-live'), 'bash-3')).resolves.toBe(true)
     killResult = { ok: false }
     await expect(face.killJob(SessionId('sess-live'), 'bash-4')).resolves.toBe(false)
-    expect(kills).toEqual([['sess-live', 'bash-3'], ['sess-live', 'bash-4']])
+    expect(kills).toEqual([
+      ['sess-live', 'bash-3'],
+      ['sess-live', 'bash-4'],
+    ])
+  })
+
+  it('admits no Stop while unavailable or after the running row leaves the current roster', async () => {
+    const { ctx, state } = await bench()
+    const entry = ctx.slots.entries('conversation.session.header.actions').find(row => row.options.id === 'job-list')
+    const inject = entry?.inject as (() => JobListInjected) | undefined
+    if (inject === undefined) throw new Error('job-list entry registered no inject face')
+    const face = inject()
+    const initial = state.getSnapshot()
+    state.set({ ...initial, rosterStatus: { 'sess-live': { state: 'loading', error: null } } })
+    await expect(face.killJob(SessionId('sess-live'), 'bash-3')).resolves.toBe(false)
+    state.set({ ...initial, rows: {} })
+    await expect(face.killJob(SessionId('sess-live'), 'bash-3')).resolves.toBe(false)
+    state.set({ ...initial, rows: { 'sess-live': [] } })
+    await expect(face.killJob(SessionId('sess-live'), 'bash-3')).resolves.toBe(false)
+    state.set({ ...initial, rows: { 'sess-live': [{ ...initial.rows['sess-live']![0]!, status: 'stopping' }] } })
+    await expect(face.killJob(SessionId('sess-live'), 'bash-3')).resolves.toBe(false)
+    await expect(face.killJob(SessionId('unwatched'), 'bash-3')).resolves.toBe(false)
+    await ctx.fiber.dispose()
   })
 
   it('registers the header action, and fiber teardown removes it (HMR safety)', async () => {

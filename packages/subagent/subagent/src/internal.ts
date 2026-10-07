@@ -8,8 +8,8 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock, MessageId, MessageSource } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
-import type SubagentRuntime from './index.ts'
 import type { SubagentDelivery } from './inbox.ts'
+import type SubagentRuntime from './index.ts'
 
 /** Process-stable identity carried only by the standard adjacent-Agent messaging tool. */
 export const adjacentAgentSendMessageTool = Symbol.for('dsh.subagent.adjacentAgentSendMessageTool')
@@ -41,12 +41,15 @@ export function isAdjacentAgentSendMessageTool(definition: ToolDefinition | unde
  */
 export const deliverSubagentPrompt = Symbol.for('dsh.subagent.deliverPrompt')
 
+/** Prompt blocks or deferred attachment admission, evaluated only for a new message. */
+export type HostPromptContent = ContentBlock[] | (() => Promise<ContentBlock[]>)
+
 /** Runtime face required by the host-only prompt adapters. */
 export interface HostPromptDeliverer {
   [deliverSubagentPrompt](
     parent: Agent,
     childId: SessionId,
-    content: ContentBlock[],
+    content: HostPromptContent,
     source: MessageSource,
     signal: AbortSignal,
     delivery: SubagentDelivery,

@@ -1,18 +1,26 @@
 // Session-header background jobs driven by a real `ctx.jobs` entry. No model
 // call is involved.
-import { readFile, writeFile } from 'node:fs/promises'
-import { fileURLToPath } from 'node:url'
-import { join } from 'node:path'
-import type { Browser, Page } from 'playwright'
-import { chromium } from 'playwright'
-import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { JobController } from '@deepseek-ai/dsh-api-job-controller'
+import { JobId } from '@deepseek-ai/dsh-jobs'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import { JobId } from '@deepseek-ai/dsh-jobs'
+import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
+import { readFile, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import type { Browser, Page } from 'playwright'
+import { chromium } from 'playwright'
+import { afterAll, beforeAll, describe, expect, it, onTestFailed, vi } from 'vitest'
 import {
-  assertFixtureInventory, captureStableAria, compareOrRefreshGolden,
-  launchWebScaffold, seedSession, watchConsole, webSnapshotMode, type WebScaffold,
+  assertFixtureInventory,
+  captureStableAria,
+  compareOrRefreshGolden,
+  launchWebScaffold,
+  seedSession,
+  watchConsole,
+  webSnapshotMode,
+  type WebScaffold,
 } from './scaffold.ts'
 import { newEnglishPage, saveFailureShot } from './support.ts'
 
@@ -20,6 +28,9 @@ const FIXTURE = fileURLToPath(new URL('../../../snapshots/web/fresh-round-trip/s
 const SNAPSHOT_DIR = fileURLToPath(new URL('../../../snapshots/web/background-job-list', import.meta.url))
 const RUNNING_EXPECTED = join(SNAPSHOT_DIR, 'running.expected.md')
 const SETTLED_EXPECTED = join(SNAPSHOT_DIR, 'settled.expected.md')
+const LOADING_EXPECTED = join(SNAPSHOT_DIR, 'loading.expected.md')
+const FAILED_EXPECTED = join(SNAPSHOT_DIR, 'failed.expected.md')
+const RETRYING_EXPECTED = join(SNAPSHOT_DIR, 'retrying.expected.md')
 const MODE = webSnapshotMode()
 const SEED_ID = 'background-job-list-web-e2e'
 // A hold on a barrier file the test owns in the job's cwd: the process never
@@ -51,9 +62,57 @@ describe.skipIf(MODE === 'record')('web e2e: background job list', () => {
   let page: Page
   let tripwire: ReturnType<typeof watchConsole>
   let agent: Agent
+  const initial = Promise.withResolvers<undefined>()
+  const failure = Promise.withResolvers<undefined>()
+  const retry = Promise.withResolvers<undefined>()
+  let opens = 0
+  let closed = 0
+  let restoreList: (() => void) | undefined
 
   beforeAll(async () => {
     scaffold = await launchWebScaffold({})
+    const list = scaffold.ctx.jobController.list.bind(scaffold.ctx.jobController)
+    const spy = vi.spyOn(scaffold.ctx.jobController, 'list').mockImplementation(async function* (
+      this: JobController,
+      request,
+      signal,
+    ) {
+      const ordinal = ++opens
+      const controller = new AbortController()
+      const abort = () => {
+        controller.abort(signal.reason)
+      }
+      signal.addEventListener('abort', abort, { once: true })
+      if (signal.aborted) abort()
+      const iterator = list.call(this, request, controller.signal)[Symbol.asyncIterator]()
+      try {
+        // Delay actual Host delivery, then fail only its first carrier. The
+        // shipping Gateway and jobs service own every client state transition.
+        await (ordinal === 1 ? initial.promise : retry.promise)
+        while (!signal.aborted) {
+          const next = iterator.next()
+          const result =
+            ordinal === 1
+              ? await Promise.race([
+                next,
+                failure.promise.then(() => {
+                  throw new RemoteError('gateway/bad-request', 'Roster fixture interrupted', {})
+                }),
+              ])
+              : await next
+          if (result.done) return
+          yield result.value
+        }
+      } finally {
+        controller.abort()
+        await iterator.return?.()
+        signal.removeEventListener('abort', abort)
+        closed++
+      }
+    })
+    restoreList = () => {
+      spy.mockRestore()
+    }
     await seedSession(scaffold, await readFile(FIXTURE, 'utf8'), SEED_ID)
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
@@ -75,15 +134,34 @@ describe.skipIf(MODE === 'record')('web e2e: background job list', () => {
   }, 120_000)
 
   afterAll(async () => {
-    if (scaffold !== undefined) await writeFile(join(scaffold.workspaceCwd, RELEASE), '')
-    await browser?.close()
-    await scaffold?.close()
+    initial.resolve(undefined)
+    failure.resolve(undefined)
+    retry.resolve(undefined)
+    const failures: unknown[] = []
+    if (scaffold !== undefined)
+      await writeFile(join(scaffold.workspaceCwd, RELEASE), '').catch((error: unknown) => failures.push(error))
+    await browser?.close().catch((error: unknown) => failures.push(error))
+    await scaffold?.close().catch((error: unknown) => failures.push(error))
+    restoreList?.()
+    if (failures.length === 1) throw failures[0]
+    if (failures.length > 1) throw new AggregateError(failures, 'Background jobs teardown failed')
   })
 
-  it('shows a running background job in the header without a refresh, then kills it from the two-press stop control', async () => {
+  it('distinguishes an opening empty roster, retains failed rows and retries before confirming a real job kill', async () => {
     let phase = 'running'
     onTestFailed(() => saveFailureShot(page, `web-e2e-background-job-${phase}`))
-    // Polling for zero would pass at t=0 before delivery and prove nothing.
+    const loading = page.getByRole('button', { name: 'Connecting to background jobs', exact: true })
+    await loading.waitFor()
+    await loading.click()
+    await page.getByRole('status').filter({ hasText: 'Connecting to background jobs' }).waitFor()
+    await compareOrRefreshGolden(
+      LOADING_EXPECTED,
+      await captureStableAria(page, '[class*="menu"]', scaffold.workspaceCwd),
+      MODE,
+    )
+    initial.resolve(undefined)
+    await loading.waitFor({ state: 'detached' })
+    expect(opens).toBe(1)
     const trigger = page.getByRole('button', { name: '1 background job running' })
     expect(await trigger.count()).toBe(0)
 
@@ -94,7 +172,7 @@ describe.skipIf(MODE === 'record')('web e2e: background job list', () => {
       arguments: { command: COMMAND, description: 'Hold a background slot open', run_in_background: true },
       agent,
     })
-    const reported = started.content.map(block => block.type === 'text' ? block.text : '').join('')
+    const reported = started.content.map(block => (block.type === 'text' ? block.text : '')).join('')
     const matched = /\bbash-\d+\b/.exec(reported)
     if (matched === null) throw new Error(`background bash reported no job id: ${reported}`)
     const jobId = JobId(matched[0])
@@ -110,6 +188,34 @@ describe.skipIf(MODE === 'record')('web e2e: background job list', () => {
     expect(tripwire.pageErrors).toEqual([])
     expect(tripwire.warnings).toEqual([])
 
+    phase = 'failed-roster'
+    const armed = page.locator('[data-kill-state]')
+    await armed.click()
+    await expect.poll(() => armed.getAttribute('data-kill-state')).toBe('armed')
+    failure.resolve(undefined)
+    await page.getByRole('alert').filter({ hasText: 'Roster fixture interrupted' }).waitFor()
+    expect(await page.locator('[data-kill-state]').count()).toBe(0)
+    expect(scaffold.ctx.jobs.get(jobId, agent.id).status).toBe('running')
+    await compareOrRefreshGolden(
+      FAILED_EXPECTED,
+      await captureStableAria(page, '[class*="menu"]', scaffold.workspaceCwd, { runningJobs: 'keep' }),
+      MODE,
+    )
+    await page.getByRole('button', { name: 'Retry', exact: true }).click()
+    await page.getByRole('status').filter({ hasText: 'Connecting to background jobs' }).waitFor()
+    await expect.poll(() => opens).toBe(2)
+    expect(closed).toBe(1)
+    expect(await page.locator('[data-kill-state]').count()).toBe(0)
+    await compareOrRefreshGolden(
+      RETRYING_EXPECTED,
+      await captureStableAria(page, '[class*="menu"]', scaffold.workspaceCwd, { runningJobs: 'keep' }),
+      MODE,
+    )
+    retry.resolve(undefined)
+    await trigger.waitFor()
+    await expect.poll(() => page.locator('[data-kill-state]').getAttribute('data-kill-state')).toBe('idle')
+    expect(opens).toBe(2)
+
     phase = 'settled'
     // The whole human path: arm, confirm, job.kill, registry kill, jobs
     // frames flipping the row — no registry call from the test.
@@ -123,10 +229,9 @@ describe.skipIf(MODE === 'record')('web e2e: background job list', () => {
     const idle = page.getByRole('button', { name: '1 background job', exact: true })
     await idle.waitFor({ timeout: 20_000 })
     // The unclaimed report's reason lands in the settled row's detail.
-    await expect.poll(
-      () => page.getByRole('list', { name: 'Background jobs' }).textContent(),
-      { timeout: 15_000 },
-    ).toContain('cancelled by the user')
+    await expect
+      .poll(() => page.getByRole('list', { name: 'Background jobs' }).textContent(), { timeout: 15_000 })
+      .toContain('cancelled by the user')
     expect(scaffold.ctx.jobs.get(jobId, agent.id).status).toBe('killed')
 
     const settled = await captureStableAria(page, '[class*="menu"]', scaffold.workspaceCwd)
@@ -136,6 +241,12 @@ describe.skipIf(MODE === 'record')('web e2e: background job list', () => {
   }, 90_000)
 
   it('keeps its snapshot inventory closed', async () => {
-    await assertFixtureInventory(SNAPSHOT_DIR, ['running.expected.md', 'settled.expected.md'])
+    await assertFixtureInventory(SNAPSHOT_DIR, [
+      'loading.expected.md',
+      'running.expected.md',
+      'failed.expected.md',
+      'retrying.expected.md',
+      'settled.expected.md',
+    ])
   })
 })

@@ -12,14 +12,21 @@ import type {} from '@deepseek-ai/dsh-api-job-controller/remote'
 import { ClientJobsModel } from './model.ts'
 import { ClientJobs } from './service.ts'
 
-export type { JobsSnapshot, ObservedJob } from './model.ts'
+export type { JobRosterState, JobsSnapshot, ObservedJob } from './model.ts'
 // The `ctx.jobs` contract. Its module also carries the Context augmentation
 // that declares `ctx.jobs`, which reaches consumers only through this export:
 // declaration emit drops the value import above.
-export type { IJobs } from './service.ts'
 export type {
-  JobChunk, JobKillRequest, JobKillValue, JobFollowFrame, JobFollowRequest, JobListFrame, JobListRequest, JobView,
+  JobChunk,
+  JobFollowFrame,
+  JobFollowRequest,
+  JobKillRequest,
+  JobKillValue,
+  JobListFrame,
+  JobListRequest,
+  JobView,
 } from '../types.ts'
+export type { IJobs } from './service.ts'
 
 /** Required Client Remote services. */
 export const inject = ['remote', 'remote.job']

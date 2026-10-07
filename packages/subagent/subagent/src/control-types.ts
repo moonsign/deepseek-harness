@@ -83,7 +83,7 @@ export type SubagentAddress =
 
 /** One human message addressed to a continuable direct child. */
 export interface SubagentPromptRequest {
-  /** Identity persisted on the accepted message, minted before the call. */
+  /** Admission identity minted before the call; retries return the original receipt without adding work. */
   readonly requestId: SubagentPromptRequestId
   readonly parentSessionId: SessionId
   readonly childSessionId: SessionId
@@ -101,7 +101,7 @@ export interface SubagentPromptRequest {
   readonly clientTimeZone?: string
 }
 
-/** Inbox identity returned once the continuation accepts one human message. */
+/** Original inbox identity returned for a human admission, including same-request retries. */
 export interface SubagentPromptReceipt {
   readonly messageId: MessageId
 }

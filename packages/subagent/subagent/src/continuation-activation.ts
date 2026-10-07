@@ -10,14 +10,9 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import type {
-  Agent,
-  AgentHandle,
-  AgentOptions,
-  CreateAgentOptions,
-} from '@deepseek-ai/dsh-agent'
-import { errorChain } from '@deepseek-ai/dsh-llm'
+import type { Agent, AgentHandle, AgentOptions, CreateAgentOptions } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
+import { errorChain } from '@deepseek-ai/dsh-llm'
 import type {
   SessionEvent,
   SessionId,
@@ -25,16 +20,13 @@ import type {
   UserMessage,
 } from '@deepseek-ai/dsh-session'
 import type { ToolRestriction } from '@deepseek-ai/dsh-tools'
-import {
-  appendDelegatedPolicyOverrides,
-  applyChildComposition,
-} from './child-agent.ts'
 import type { DelegatedPolicyOverrides } from './child-agent.ts'
+import { appendDelegatedPolicyOverrides, applyChildComposition } from './child-agent.ts'
 import { createSettlementMessage } from './continuation-messages.ts'
 import type { SubagentDescriptorData } from './descriptor.ts'
 import { SubagentError } from './error.ts'
-import { SubagentInbox } from './inbox.ts'
 import type { SubagentDelivery } from './inbox.ts'
+import { SubagentInbox } from './inbox.ts'
 import type { ActivationObserver, ActivationTerminal } from './lifecycle.ts'
 
 /** Process-local slots shared through uninterrupted continuable parent links. */
@@ -45,14 +37,16 @@ class ActivationPool {
   reserve(capacity: number): () => void {
     if (this.slots.size >= capacity) {
       throw new SubagentError(
-        `subagent limit reached (active child limit: ${capacity}); wait for an existing child to finish `
-        + 'or complete this work with the current agents',
+        `subagent limit reached (active child limit: ${capacity}); wait for an existing child to finish ` +
+          'or complete this work with the current agents',
         'ACTIVATION_LIMIT_REACHED',
       )
     }
     const slot = Symbol()
     this.slots.add(slot)
-    return () => { this.slots.delete(slot) }
+    return () => {
+      this.slots.delete(slot)
+    }
   }
 }
 
@@ -144,9 +138,7 @@ interface Materialization {
 type SettlementState = 'closed' | 'retry' | 'wait' | 'ready'
 
 /** Result of the final child-lock settlement decision. */
-type SettlementAttempt =
-  | Exclude<SettlementState, 'ready'>
-  | { readonly done: Promise<void> }
+type SettlementAttempt = Exclude<SettlementState, 'ready'> | { readonly done: Promise<void> }
 
 /** Serialize each durable child's delivery, release, and disposal. */
 export class ChildLock {
@@ -163,7 +155,10 @@ export class ChildLock {
     const result = previous.then(operation, operation)
     // Absorb rejections in the chaining tail so one failed critical section
     // cannot reject an unrelated later caller.
-    const tail = result.then(() => undefined, () => undefined)
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    )
     this.tails.set(childId, tail)
     void tail.then(() => {
       if (this.tails.get(childId) === tail) this.tails.delete(childId)
@@ -178,6 +173,8 @@ export class ContinuableActivationRegistry {
   private readonly resident = new Map<SessionId, Activation>()
   /** Root identities retain their pool across child settlement without retaining dead roots. */
   private readonly rootPools = new WeakMap<Agent, ActivationPool>()
+  /** Pending callers retain each edge independently of an established child. */
+  private readonly ownershipHolds = new WeakMap<Activation, Map<SessionId, { count: number }>>()
   /** Materializations admitted before drain, tracked through publication or rollback. */
   private readonly materializations = new Set<Materialization>()
   /** Per-child serializer shared by delivery, release, and disposal. */
@@ -200,11 +197,7 @@ export class ContinuableActivationRegistry {
    */
   constructor(
     private readonly ctx: Context,
-    private readonly observeActivation: (
-      provider: string,
-      childId: SessionId,
-      parent: Agent,
-    ) => ActivationObserver,
+    private readonly observeActivation: (provider: string, childId: SessionId, parent: Agent) => ActivationObserver,
     private readonly maxActiveSubagents: () => number,
   ) {
     // Ordinary Cordis owner effects unwind in reverse registration order, which
@@ -218,10 +211,13 @@ export class ContinuableActivationRegistry {
     ctx.on('agent/disposed', ({ agent }) => {
       this.closingScopes.delete(agent)
     })
-    ctx.effect(function* (this: ContinuableActivationRegistry) {
-      yield scope.dispose
-      yield () => this.drain()
-    }.bind(this), 'subagents.continuations()')
+    ctx.effect(
+      function* (this: ContinuableActivationRegistry) {
+        yield scope.dispose
+        yield () => this.drain()
+      }.bind(this),
+      'subagents.continuations()',
+    )
   }
 
   /**
@@ -246,12 +242,11 @@ export class ContinuableActivationRegistry {
   /**
    * Pre-register `childId` in a continuation-managed parent's owned set so the
    * parent cannot settle while a caller is still establishing or resuming that
-   * child. Returns a releaser for the failure path; it removes only a hold
-   * this call added, and leaves ownership in place once a live Activation for
-   * the child exists.
+   * child. Each caller holds the edge until its operation finishes; releasing
+   * one caller preserves other pending holds and any established child.
    * @param parent - the live direct parent the operation is admitted under.
    * @param childId - the durable child the operation addresses.
-   * @returns the failure-path releaser; a no-op when nothing was added.
+   * @returns an idempotent releaser; a no-op for an unmanaged parent.
    */
   holdOwnership(parent: Agent, childId: SessionId): () => void {
     const parentActivation = this.resident.get(parent.id)
@@ -262,15 +257,23 @@ export class ContinuableActivationRegistry {
         'ACTIVATION_CLOSING',
       )
     }
-    if (parentActivation.ownedChildren.has(childId)) return () => {}
+    let holds = this.ownershipHolds.get(parentActivation)
+    if (holds === undefined) {
+      holds = new Map()
+      this.ownershipHolds.set(parentActivation, holds)
+    }
+    const hold = holds.get(childId) ?? { count: 0 }
+    holds.set(childId, hold)
+    hold.count++
     parentActivation.ownedChildren.add(childId)
+    let released = false
     return () => {
+      if (released) return
+      released = true
+      if (--hold.count > 0) return
+      holds.delete(childId)
       const live = this.resident.get(childId)
-      /* v8 ignore next 4 -- reaching this arm needs another delivery to establish the child
-       * between this operation's failure and its releaser running, which no test can schedule
-       * deterministically: the ownership edge then belongs to that live Activation, so the
-       * conservative keep leaves it for finishDisposal's releaseOwnership. */
-      if (live !== undefined && live.inbox.closing === undefined) return
+      if (live !== undefined && live.parentSession === parent.id && live.ancestry.has(parent)) return
       if (parentActivation.ownedChildren.delete(childId)) this.wake(parentActivation)
     }
   }
@@ -295,20 +298,14 @@ export class ContinuableActivationRegistry {
         )
       }
       if (caller.id === targetSessionId) {
-        throw new SubagentError(
-          `agent "${caller.id}" cannot interrupt itself`,
-          'UNAUTHORIZED',
-        )
+        throw new SubagentError(`agent "${caller.id}" cannot interrupt itself`, 'UNAUTHORIZED')
       }
     }
     const activation = this.resident.get(targetSessionId)
     if (activation === undefined) return
     if (authority.kind === 'user') {
       if (activation.handle.agent.session.header.parentSession !== authority.parentSessionId) {
-        throw new SubagentError(
-          `subagent "${targetSessionId}" belongs to another parent session`,
-          'UNAUTHORIZED',
-        )
+        throw new SubagentError(`subagent "${targetSessionId}" belongs to another parent session`, 'UNAUTHORIZED')
       }
     } else if (!activation.ancestry.has(authority.agent)) {
       throw new SubagentError(
@@ -319,10 +316,9 @@ export class ContinuableActivationRegistry {
     // Disposal already stopped the target with a whole-Activation teardown;
     // a second cancel would be a redundant signal on a closing handle.
     if (activation.inbox.closing !== undefined) return
-    activation.handle.agent.cancel(
-      authority.kind === 'user' ? { kind: 'user' } : { kind: 'parent' },
-      { keepInbox: true },
-    )
+    activation.handle.agent.cancel(authority.kind === 'user' ? { kind: 'user' } : { kind: 'parent' }, {
+      keepInbox: true,
+    })
   }
 
   /**
@@ -376,8 +372,7 @@ export class ContinuableActivationRegistry {
     const targets: Activation[] = []
     for (const activation of this.resident.values()) {
       const lineage = this.liveLineage(activation.handle.agent)
-      const owners = [...roots].filter(root => activation.handle.agent !== root
-        && activation.ancestry.has(root))
+      const owners = [...roots].filter(root => activation.handle.agent !== root && activation.ancestry.has(root))
       if (owners.length === 0) continue
       targets.push(activation)
       for (const owner of owners) {
@@ -424,10 +419,7 @@ export class ContinuableActivationRegistry {
       const activation = this.resident.get(childId)
       if (activation === undefined) continue
       if (activation.parentSession !== parent.id || !activation.ancestry.has(parent)) {
-        throw new SubagentError(
-          `subagent "${childId}" is not a direct child of agent "${parent.id}"`,
-          'UNAUTHORIZED',
-        )
+        throw new SubagentError(`subagent "${childId}" is not a direct child of agent "${parent.id}"`, 'UNAUTHORIZED')
       }
       targets.push(activation)
     }
@@ -460,16 +452,9 @@ export class ContinuableActivationRegistry {
    * @param childId - durable child session id addressed by the operation.
    * @param parentSession - durable direct-parent id recorded by the child.
    */
-  authorizeLineage(
-    parent: Agent,
-    childId: SessionId,
-    parentSession: SessionId | undefined,
-  ): void {
+  authorizeLineage(parent: Agent, childId: SessionId, parentSession: SessionId | undefined): void {
     if (this.ctx.agents.get(parent.id) !== parent) {
-      throw new SubagentError(
-        `subagent "${childId}" delivery requires the exact live parent agent`,
-        'UNAUTHORIZED',
-      )
+      throw new SubagentError(`subagent "${childId}" delivery requires the exact live parent agent`, 'UNAUTHORIZED')
     }
     if (parentSession !== parent.id) {
       throw new SubagentError(`subagent "${childId}" belongs to another parent session`, 'UNAUTHORIZED')
@@ -493,13 +478,15 @@ export class ContinuableActivationRegistry {
       settled: settled.promise,
     }
     this.materializations.add(materialization)
-    return this.materializeTracked(inputs, lineage, pool, releaseSlot).catch((error: unknown) => {
-      releaseSlot()
-      throw error
-    }).finally(() => {
-      this.materializations.delete(materialization)
-      settled.resolve()
-    })
+    return this.materializeTracked(inputs, lineage, pool, releaseSlot)
+      .catch((error: unknown) => {
+        releaseSlot()
+        throw error
+      })
+      .finally(() => {
+        this.materializations.delete(materialization)
+        settled.resolve()
+      })
   }
 
   /**
@@ -520,11 +507,7 @@ export class ContinuableActivationRegistry {
   ): MessageId {
     signal.throwIfAborted()
     this.assertAdmitting(parent)
-    this.authorizeLineage(
-      parent,
-      activation.childId,
-      activation.handle.agent.session.header.parentSession,
-    )
+    this.authorizeLineage(parent, activation.childId, activation.handle.agent.session.header.parentSession)
     this.acquireOwnership(parent, activation.childId)
     try {
       activation.inbox.deliver(message, delivery)
@@ -549,19 +532,21 @@ export class ContinuableActivationRegistry {
     roots: readonly Activation[],
     failureSubject: 'activation(s)' | 'scoped activation(s)' | 'selected activation(s)',
   ): Promise<void> {
-    const failures = await Promise.all(roots.map(async (activation) => {
-      try {
-        await this.dispose(activation)
-        return undefined
-      } catch (error: unknown) {
-        return error
-      }
-    }))
+    const failures = await Promise.all(
+      roots.map(async (activation) => {
+        try {
+          await this.dispose(activation)
+          return undefined
+        } catch (error: unknown) {
+          return error
+        }
+      }),
+    )
     const reasons = failures.filter(failure => failure !== undefined)
     if (reasons.length > 0) {
       throw new SubagentError(
-        `continuable subagent teardown failed for ${reasons.length} ${failureSubject}: `
-        + reasons.map(reason => errorChain(reason)).join('; '),
+        `continuable subagent teardown failed for ${reasons.length} ${failureSubject}: ` +
+          reasons.map(reason => errorChain(reason)).join('; '),
         'ACTIVATION_TEARDOWN_FAILED',
       )
     }
@@ -630,24 +615,25 @@ export class ContinuableActivationRegistry {
       applyChildComposition(childCtx, parent, inputs.composition)
     }
     const observer = this.observeActivation(provider, childId, parent)
-    const handle: AgentHandle = create === undefined
-      ? await this.ownerCtx.agents.resume({
-        resumeSessionId: childId,
-        parentAgent: parent,
-        agentOptions: inputs.agentOptions,
-        signal: inputs.signal,
-        setup,
-      })
-      : await this.ownerCtx.agents.create({
-        sessionId: childId,
-        parentAgent: parent,
-        meta: create.meta,
-        ...(create.seed === undefined ? {} : { seed: create.seed }),
-        inheritedEventCount: create.inheritedEventCount,
-        agentOptions: inputs.agentOptions,
-        signal: inputs.signal,
-        setup,
-      })
+    const handle: AgentHandle =
+      create === undefined
+        ? await this.ownerCtx.agents.resume({
+          resumeSessionId: childId,
+          parentAgent: parent,
+          agentOptions: inputs.agentOptions,
+          signal: inputs.signal,
+          setup,
+        })
+        : await this.ownerCtx.agents.create({
+          sessionId: childId,
+          parentAgent: parent,
+          meta: create.meta,
+          ...(create.seed === undefined ? {} : { seed: create.seed }),
+          inheritedEventCount: create.inheritedEventCount,
+          agentOptions: inputs.agentOptions,
+          signal: inputs.signal,
+          setup,
+        })
 
     const activation: Activation = {
       pool,
@@ -668,7 +654,9 @@ export class ContinuableActivationRegistry {
       inputs.signal.throwIfAborted()
       this.assertAdmitting(parent)
       this.acquireOwnership(parent, childId)
-      const wakeOnInboxRemoval = (): void => { this.wake(activation) }
+      const wakeOnInboxRemoval = (): void => {
+        this.wake(activation)
+      }
       handle.agent.ctx.on('agent/inbox/claimed', wakeOnInboxRemoval)
       handle.agent.ctx.on('agent/inbox/discarded', wakeOnInboxRemoval)
       observer.start(handle.agent)
@@ -711,6 +699,7 @@ export class ContinuableActivationRegistry {
   /** Remove one child from its live owner's set and let that owner re-check settlement. */
   private releaseOwnership(childId: SessionId): void {
     for (const candidate of this.resident.values()) {
+      if (this.ownershipHolds.get(candidate)?.has(childId)) continue
       if (candidate.ownedChildren.delete(childId)) this.wake(candidate)
     }
   }
@@ -728,9 +717,9 @@ export class ContinuableActivationRegistry {
         const idleObservation = activation.poke
         await activation.handle.agent.whenIdle()
         if (activation.inbox.closing !== undefined) return
-        const readiness = await this.locks.run(activation.childId, () => Promise.resolve(
-          this.settlementState(activation, idleObservation),
-        ))
+        const readiness = await this.locks.run(activation.childId, () =>
+          Promise.resolve(this.settlementState(activation, idleObservation)),
+        )
         if (readiness === 'closed') return
         if (readiness === 'retry') continue
         if (readiness === 'wait') {
@@ -769,9 +758,7 @@ export class ContinuableActivationRegistry {
         try {
           await attempt.done
         } catch (error: unknown) {
-          this.ctx.logger.warn(
-            `subagent "${activation.childId}" activation teardown failed: ${errorChain(error)}`,
-          )
+          this.ctx.logger.warn(`subagent "${activation.childId}" activation teardown failed: ${errorChain(error)}`)
         }
         return
       }
@@ -779,10 +766,7 @@ export class ContinuableActivationRegistry {
   }
 
   /** Classify one Inbox and owned-child observation without reading Agent execution state. */
-  private settlementState(
-    activation: Activation,
-    observation: PromiseWithResolvers<void>,
-  ): SettlementState {
+  private settlementState(activation: Activation, observation: PromiseWithResolvers<void>): SettlementState {
     if (activation.inbox.closing !== undefined) return 'closed'
     if (activation.poke !== observation) return 'retry'
     if (activation.inbox.hasPending || activation.ownedChildren.size > 0) return 'wait'
@@ -798,11 +782,13 @@ export class ContinuableActivationRegistry {
       try {
         activation.observer.capture(activation.handle.agent)
       } catch (error: unknown) {
-        failures.push(new SubagentError(
-          `subagent "${childId}" activation teardown failed: ${errorChain(error)}`,
-          'ACTIVATION_TEARDOWN_FAILED',
-          { cause: error },
-        ))
+        failures.push(
+          new SubagentError(
+            `subagent "${childId}" activation teardown failed: ${errorChain(error)}`,
+            'ACTIVATION_TEARDOWN_FAILED',
+            { cause: error },
+          ),
+        )
       }
     } else {
       activation.handle.agent.cancel({ kind: 'parent' })
@@ -812,40 +798,48 @@ export class ContinuableActivationRegistry {
         .filter((child): child is Activation => child !== undefined)
       const childDisposals = children.map(child => this.dispose(child))
       try {
-        const childFailures = await Promise.all(childDisposals.map(async (disposal) => {
-          try {
-            await disposal
-            return undefined
-          } catch (error: unknown) {
-            return error
-          }
-        }))
+        const childFailures = await Promise.all(
+          childDisposals.map(async (disposal) => {
+            try {
+              await disposal
+              return undefined
+            } catch (error: unknown) {
+              return error
+            }
+          }),
+        )
         const reasons = childFailures.filter(reason => reason !== undefined)
         if (reasons.length > 0) {
-          failures.push(new SubagentError(
-            `subagent "${childId}" child teardown failed: ${reasons.map(reason => errorChain(reason)).join('; ')}`,
-            'ACTIVATION_TEARDOWN_FAILED',
-          ))
+          failures.push(
+            new SubagentError(
+              `subagent "${childId}" child teardown failed: ${reasons.map(reason => errorChain(reason)).join('; ')}`,
+              'ACTIVATION_TEARDOWN_FAILED',
+            ),
+          )
         }
         await idle
         await this.flushFinalState(activation)
         activation.observer.capture(activation.handle.agent)
       } catch (error: unknown) {
-        failures.push(new SubagentError(
-          `subagent "${childId}" activation teardown failed: ${errorChain(error)}`,
-          'ACTIVATION_TEARDOWN_FAILED',
-          { cause: error },
-        ))
+        failures.push(
+          new SubagentError(
+            `subagent "${childId}" activation teardown failed: ${errorChain(error)}`,
+            'ACTIVATION_TEARDOWN_FAILED',
+            { cause: error },
+          ),
+        )
       }
     }
     try {
       await activation.handle.dispose()
     } catch (error: unknown) {
-      failures.push(new SubagentError(
-        `subagent "${childId}" activation handle disposal failed: ${errorChain(error)}`,
-        'ACTIVATION_TEARDOWN_FAILED',
-        { cause: error },
-      ))
+      failures.push(
+        new SubagentError(
+          `subagent "${childId}" activation handle disposal failed: ${errorChain(error)}`,
+          'ACTIVATION_TEARDOWN_FAILED',
+          { cause: error },
+        ),
+      )
     }
 
     let failure: SubagentError | undefined
@@ -853,8 +847,8 @@ export class ContinuableActivationRegistry {
       failure = failures[0]
     } else if (failures.length > 1) {
       failure = new SubagentError(
-        `subagent "${childId}" activation teardown failed at ${failures.length} boundaries: `
-        + failures.map(item => errorChain(item)).join('; '),
+        `subagent "${childId}" activation teardown failed at ${failures.length} boundaries: ` +
+          failures.map(item => errorChain(item)).join('; '),
         'ACTIVATION_TEARDOWN_FAILED',
         { cause: new AggregateError(failures) },
       )
@@ -881,8 +875,7 @@ export class ContinuableActivationRegistry {
       this.sendWaking(parent, message, parent.status === 'idle' ? 'queue' : 'steer')
     } catch (error: unknown) {
       this.ctx.logger.warn(
-        `subagent "${activation.childId}" settlement notice was not delivered to its parent: `
-        + errorChain(error),
+        `subagent "${activation.childId}" settlement notice was not delivered to its parent: ` + errorChain(error),
       )
     }
   }
@@ -894,8 +887,8 @@ export class ContinuableActivationRegistry {
       await child.ctx.sessions.flush(child.session)
     } catch (error: unknown) {
       this.ctx.logger.warn(
-        `subagent "${activation.childId}" best-effort final session flush failed; `
-        + `the persisted state may be unavailable or stale on resume: ${errorChain(error)}`,
+        `subagent "${activation.childId}" best-effort final session flush failed; ` +
+          `the persisted state may be unavailable or stale on resume: ${errorChain(error)}`,
       )
     }
   }

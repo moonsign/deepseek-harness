@@ -2,7 +2,7 @@
  * Client configuration values and atomic write operations.
  */
 
-import type { SettingsPathOpView } from '@deepseek-ai/dsh-api-remotes/client'
+import type { RemoteResult, SettingsNamespaceView, SettingsPathOpView } from '@deepseek-ai/dsh-api-remotes/client'
 
 /** Client-side sync state of one settings namespace. */
 export interface ConfigFormSnapshot<T> {
@@ -53,9 +53,22 @@ export interface ConfigForm<T> {
    * @param ops - ordered field operations copied when queued.
    * @param expectedRevision - optional fixed revision read by the domain editor.
    * @returns true for Host acceptance, false for refusal or skipped writes, after any latest-write recovery.
-   * Transport failures reject.
+   * Carrier failures return false; assembly faults reject.
    */
   mutate(ops: readonly SettingsPathOpView[], expectedRevision?: number): Promise<boolean>
+  /**
+   * Queue the same mutation while preserving the Host result and typed refusal details.
+   * Ordering, revision fencing and latest-write recovery match {@link mutate}.
+   * @param ops - ordered field operations copied when queued.
+   * @param expectedRevision - optional fixed revision read by the domain editor.
+   * @returns the original Remote result after any recovery; undefined for local memory
+   * or disposed skips. A started write returns its result even after disposal.
+   * Carrier failures remain in the result; assembly faults reject.
+   */
+  mutateResult(
+    ops: readonly SettingsPathOpView[],
+    expectedRevision?: number,
+  ): Promise<RemoteResult<SettingsNamespaceView> | undefined>
   /**
    * Queue one field write. Rapid writes preserve mutation order, each carries
    * the latest known namespace revision, and only the latest settlement may
@@ -63,7 +76,7 @@ export interface ConfigForm<T> {
    * @param field - scalar field inside the namespace section.
    * @param value - JSON-shaped value selected by the user.
    * @returns true for Host acceptance, false for refusal or skipped writes, after any latest-write recovery.
-   * Transport failures reject.
+   * Carrier failures return false; assembly faults reject.
    */
   set(field: string, value: unknown): Promise<boolean>
   /**
@@ -71,7 +84,7 @@ export interface ConfigForm<T> {
    * Shares {@link set}'s ordering, revision, and recovery contract.
    * @param field - scalar field inside the namespace section.
    * @returns true for Host acceptance, false for refusal or skipped writes, after any latest-write recovery.
-   * Transport failures reject.
+   * Carrier failures return false; assembly faults reject.
    */
   unset(field: string): Promise<boolean>
 }
